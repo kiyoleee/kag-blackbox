@@ -43,6 +43,9 @@ def main():
     parser.add_argument("--fingerprints",
                         default="/data/lqy/framework/blackbox-docker/vulhub_fingerprints",
                         help="Path to vulhub_fingerprints JSON directory (highest priority)")
+    parser.add_argument("--benchmark-fingerprints",
+                        default="",
+                        help="Path to benchmark_fingerprints directory (highest priority)")
     parser.add_argument("--surper-nuclei",
                         default="",
                         help="Path to surper-666 nuclei templates directory (highest priority)")
@@ -90,8 +93,16 @@ def main():
     else:
         log.info("Phase 3: Skipped (--no-vulhub-mapping)")
 
-    log.info("Phase 4: Surper-666 fingerprints (highest priority=2)")
+    log.info("Phase 4: Surper-666 vulhub fingerprints (highest priority=2)")
     n_fp = build_from_vulhub_fingerprints(driver, args.fingerprints)
+
+    if args.benchmark_fingerprints:
+        log.info("Phase 4b: Surper-666 benchmark fingerprints (highest priority=2)")
+        # benchmark_fingerprints uses same JSON format, load from instances/ subdir too
+        n_bfp = build_from_vulhub_fingerprints(driver, args.benchmark_fingerprints)
+        instances_dir = os.path.join(args.benchmark_fingerprints, "instances")
+        if os.path.isdir(instances_dir):
+            n_bfp2 = build_from_vulhub_fingerprints(driver, instances_dir)
 
     if args.surper_nuclei:
         log.info("Phase 4a: Surper-666 Nuclei templates (highest priority=2)")
