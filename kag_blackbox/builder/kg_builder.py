@@ -651,15 +651,43 @@ def build_from_other_vul(driver, zip_path):
     templates = []
     count = 0
     errors = 0
+    skipped_dir = 0
+
+    # Directories irrelevant to HTTP blackbox testing
+    _SKIP_PREFIXES = (
+        'cloud/', 'file/', 'dns/', 'network/', 'ssl/', 'ftp/',
+        'helpers/', 'profiles/', 'workflows/', 'passive/',
+        'javascript/', 'java/', 'python/', 'ruby/', 'perl/',
+        'ssh/', 'smtp/', 'ldap/', 'redis/', 'mongodb/', 'postgres/',
+        'samba/', 'kafka/', 'rabbitmq/', 'mysql/', 'sql/',
+        'other/', 'headless/',
+    )
+    # Subdirectories to skip even under http/
+    _SKIP_HTTP_SUBS = (
+        'http/exposed-panels/', 'http/technologies/', 'http/osint/',
+        'http/honeypot/', 'http/fuzzing/', 'http/takeovers/',
+        'http/token-spray/', 'http/exposures/tokens/',
+        'http/miscellaneous/', 'http/iot/',
+    )
 
     for info in zf.infolist():
         if not info.filename.endswith(('.yaml', '.yml')) or info.is_dir():
             continue
         if info.file_size > 500000:
             continue
+
+        # Filter out non-HTTP directories
+        fname_lower = info.filename.lower()
+        if any(fname_lower.startswith(p) for p in _SKIP_PREFIXES):
+            skipped_dir += 1
+            continue
+        if any(fname_lower.startswith(p) for p in _SKIP_HTTP_SUBS):
+            skipped_dir += 1
+            continue
+
         count += 1
         if count % 5000 == 0:
-            log.info(f"  Parsed {count} other_vul templates ({errors} errors)...")
+            log.info(f"  Parsed {count} other_vul templates ({errors} errors, {skipped_dir} skipped)...")
 
         try:
             raw = zf.read(info.filename)
@@ -720,19 +748,52 @@ def build_from_other_vul(driver, zip_path):
 
         # ── xray PoC format ──
         elif 'name' in data and ('rules' in data or 'transport' in data):
+            # Only accept HTTP transport
+            transport = (data.get('transport') or 'http').lower()
+            if transport not in ('http', 'https', ''):
+                continue
+
             name = data.get('name', '')
             m = re.search(r'(CVE-\d{4}-\d+)', name, re.I)
             if not m:
                 continue
             cve_id = m.group(1).upper()
 
-            product_m = re.match(r'poc-yaml-(\w[\w-]*?)[-_]cve', name, re.I)
-            product = product_m.group(1).lower() if product_m else ''
-            if not product:
-                parts = name.replace('poc-yaml-', '').split('-cve')[0].split('_cve')[0]
-                product = parts.lower().replace('-', ' ').replace('_', ' ').split()[0] if parts else ''
-            if not product:
+            # Normalize product name from xray naming convention
+            # e.g. "poc-yaml-apache-druid-cve-2021-36749" → "apache-druid"
+            clean_name = name.replace('poc-yaml-', '').replace('poc_yaml_', '')
+            product_m = re.match(r'([\w][\w-]*?)[-_](?:cve|CVE)', clean_name)
+            product = product_m.group(1).lower().rstrip('-_') if product_m else ''
+            if not product or len(product) < 2:
                 continue
+            # Normalize common product aliases
+            _PRODUCT_ALIASES = {
+                'apache-httpd': 'apache', 'httpd': 'apache',
+                'apache-tomcat': 'tomcat', 'apache-struts': 'struts2',
+                'apache-struts2': 'struts2', 'apache-solr': 'solr',
+                'apache-druid': 'apache-druid', 'apache-ofbiz': 'ofbiz',
+                'oracle-weblogic': 'weblogic', 'weblogic-server': 'weblogic',
+            }
+            product = _PRODUCT_ALIASES.get(product, product)
+
+            # Extract PoC from xray rules
+            xray_poc = {}
+            rules = data.get('rules') or {}
+            if isinstance(rules, dict):
+                for rule_name, rule in rules.items():
+                    if not isinstance(rule, dict):
+                        continue
+                    req = rule.get('request') or {}
+                    if req.get('path'):
+                        xray_poc = {
+                            'method': (req.get('method') or 'GET').upper(),
+                            'path': str(req['path'])[:500],
+                            'headers': json.dumps(req.get('headers') or {})[:500],
+                            'body': str(req.get('body') or '')[:1000],
+                            'matcher_words': '[]',
+                            'matcher_status': '[]',
+                        }
+                        break
 
             templates.append({
                 'product': product,
@@ -743,21 +804,27 @@ def build_from_other_vul(driver, zip_path):
                 'vuln_type': '',
                 'type_cn': '安全漏洞',
                 'cwe_id': '',
-                'poc': {},
+                'poc': xray_poc,
                 'fingerprints': [],
                 'template_id': name,
             })
 
     zf.close()
-    log.info(f"  Parsed {count} files, {len(templates)} usable templates, {errors} errors")
+    log.info(f"  Parsed {count} files, {len(templates)} with CVE, "
+             f"{errors} errors, {skipped_dir} skipped (non-HTTP)")
 
     if not templates:
         return 0, 0
 
-    # Deduplicate by CVE ID — keep only one template per CVE
+    # Filter: prefer templates that have a PoC path (more useful for verification)
+    with_poc = [t for t in templates if t.get('poc') and t['poc'].get('path')]
+    without_poc = [t for t in templates if not (t.get('poc') and t['poc'].get('path'))]
+    log.info(f"  With PoC path: {len(with_poc)}, without: {len(without_poc)}")
+
+    # Deduplicate by CVE ID — prefer templates with PoC
     seen_cves = set()
     deduped = []
-    for t in templates:
+    for t in with_poc + without_poc:
         if t['cve_id'] not in seen_cves:
             seen_cves.add(t['cve_id'])
             deduped.append(t)
