@@ -927,22 +927,26 @@ def build_from_other_vul(driver, zip_path):
 
 
 def set_source_priority(driver):
-    """Set source and priority on existing CVE nodes that don't have them yet."""
+    """Set source and priority on existing CVE nodes.
+
+    Priority: surper-666 (2) > nuclei (1) > other_vul (0)
+    """
     with driver.session() as session:
-        # vulhub_fingerprints → priority 2 (highest)
+        # surper-666 fingerprints + nuclei → priority 2 (highest)
         session.run(
             """MATCH (cve:BB_CVE)
-               WHERE cve.vulhub_env IS NOT NULL AND cve.vulhub_env STARTS WITH 'activemq/'
+               WHERE cve.vulhub_env IS NOT NULL
                   OR EXISTS { MATCH (cve)<-[:BB_HAS_POC]-(poc:BB_PoC {source: 'vulhub_fingerprints'}) }
-               SET cve.source = COALESCE(cve.source, 'vulhub_fingerprints'),
+               SET cve.source = COALESCE(cve.source, 'surper-666'),
                    cve.priority = 2""")
         # nuclei → priority 1
         session.run(
             """MATCH (cve:BB_CVE)
                WHERE cve.priority IS NULL
-                 AND cve.source IS NULL
+                 AND (cve.source IS NULL OR cve.source = 'nuclei')
                SET cve.source = 'nuclei',
                    cve.priority = 1""")
+        # other_vul already set to priority=0 during import
 
 
 def build_fingerprint_index(driver):

@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -224,6 +226,141 @@ def surface_fingerprint(host, logger, token=""):
         "cookies": cookies[:3], "probes": probes,
         "reachable": any(pd["status"] > 0 for pd in probes.values()),
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 2.5: TCP Protocol Probing — non-HTTP service detection
+# ═══════════════════════════════════════════════════════════════
+
+def tcp_probe(host, port, send_data=None, timeout=5):
+    """Open a TCP connection, optionally send data, read banner."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        if send_data:
+            sock.sendall(send_data)
+        banner = b""
+        try:
+            banner = sock.recv(4096)
+        except socket.timeout:
+            pass
+        sock.close()
+        return banner
+    except Exception:
+        return b""
+
+
+def _probe_redis(host, port=6379):
+    """Redis: send PING, check for +PONG."""
+    banner = tcp_probe(host, port, b"PING\r\n")
+    text = banner.decode("utf-8", errors="replace")
+    if "+PONG" in text or "redis" in text.lower():
+        version = ""
+        info_data = tcp_probe(host, port, b"INFO server\r\n")
+        m = re.search(r"redis_version:(\S+)", info_data.decode("utf-8", errors="replace"))
+        if m:
+            version = m.group(1)
+        return {"service": "redis", "banner": text[:200], "version": version, "port": port}
+    return None
+
+
+def _probe_mysql(host, port=3306):
+    """MySQL: read greeting packet to get version."""
+    banner = tcp_probe(host, port)
+    if len(banner) > 5:
+        try:
+            version_end = banner.index(b"\x00", 5)
+            version = banner[5:version_end].decode("utf-8", errors="replace")
+            return {"service": "mysql", "banner": version, "version": version, "port": port}
+        except (ValueError, IndexError):
+            pass
+        text = banner.decode("utf-8", errors="replace")
+        if "mysql" in text.lower() or "mariadb" in text.lower():
+            return {"service": "mysql", "banner": text[:200], "version": "", "port": port}
+    return None
+
+
+def _probe_ssh(host, port=22):
+    """SSH: read version banner."""
+    banner = tcp_probe(host, port)
+    text = banner.decode("utf-8", errors="replace").strip()
+    if text.startswith("SSH-"):
+        version = text.split("-")[-1] if "-" in text else ""
+        return {"service": "ssh", "banner": text[:200], "version": version, "port": port}
+    return None
+
+
+def _probe_ftp(host, port=21):
+    """FTP: read welcome banner."""
+    banner = tcp_probe(host, port)
+    text = banner.decode("utf-8", errors="replace").strip()
+    if text.startswith("220") or "ftp" in text.lower():
+        m = re.search(r"(\d+\.\d+\.\d+\S*)", text)
+        version = m.group(1) if m else ""
+        return {"service": "ftp", "banner": text[:200], "version": version, "port": port}
+    return None
+
+
+def _probe_memcached(host, port=11211):
+    """Memcached: send version command."""
+    banner = tcp_probe(host, port, b"version\r\n")
+    text = banner.decode("utf-8", errors="replace").strip()
+    if text.startswith("VERSION") or "memcached" in text.lower():
+        version = text.replace("VERSION ", "").strip()
+        return {"service": "memcached", "banner": text[:200], "version": version, "port": port}
+    return None
+
+
+def _probe_generic(host, port):
+    """Generic banner grab for unknown services."""
+    banner = tcp_probe(host, port)
+    if not banner:
+        return None
+    text = banner.decode("utf-8", errors="replace").strip()[:200]
+    service = "unknown"
+    if "activemq" in text.lower() or b"\x00\x00\x00" in banner[:4]:
+        service = "activemq"
+    elif "dubbo" in text.lower():
+        service = "dubbo"
+    elif "mongodb" in text.lower() or port == 27017:
+        service = "mongodb"
+    elif "docker" in text.lower() or port == 2375:
+        service = "docker-api"
+    elif "ldap" in text.lower() or port == 389:
+        service = "ldap"
+    elif "smtp" in text.lower() or text.startswith("220") and port == 25:
+        service = "smtp"
+    return {"service": service, "banner": text, "version": "", "port": port}
+
+
+SERVICE_PROBES = {
+    6379: _probe_redis,
+    3306: _probe_mysql,
+    22: _probe_ssh,
+    21: _probe_ftp,
+    11211: _probe_memcached,
+}
+
+
+def multi_protocol_fingerprint(host, ports, logger=None):
+    """Probe a list of ports for non-HTTP services. Returns list of detected services."""
+    results = []
+    for port in ports:
+        if port in (80, 443, 8080, 8443, 8161, 8888, 9090):
+            continue
+        probe_fn = SERVICE_PROBES.get(port, _probe_generic)
+        try:
+            result = probe_fn(host, port)
+            if result:
+                results.append(result)
+                if logger:
+                    logger.debug(f"TCP probe {host}:{port} → {result['service']} "
+                                 f"v={result.get('version','')}")
+        except Exception as e:
+            if logger:
+                logger.debug(f"TCP probe {host}:{port} error: {e}")
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -742,6 +879,22 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                 product_name = (vm.get("app") or "").lower().strip()
                 product_cves = _vulhub_fps_by_product.get(product_name, [])
 
+                # TCP probing for non-HTTP ports from fingerprint data
+                tcp_ports = set()
+                for cfp in product_cves:
+                    for p in (cfp.get("ports") or []):
+                        if isinstance(p, int):
+                            tcp_ports.add(p)
+                if tcp_ports:
+                    tcp_results = multi_protocol_fingerprint(host, sorted(tcp_ports), logger)
+                    if tcp_results:
+                        fp["tcp_services"] = tcp_results
+                        tcp_text = "; ".join(
+                            f"{s['service']}:{s['port']} v={s.get('version','')}"
+                            for s in tcp_results
+                        )
+                        logger.debug(f"[{token}] TCP: {tcp_text}")
+
                 if len(product_cves) <= 1:
                     # ── Single CVE: probe + verify match_indicators ──
                     chosen_fp = product_cves[0] if product_cves else vm
@@ -1031,35 +1184,89 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
 # Output
 # ═══════════════════════════════════════════════════════════════
 
+def _build_vuln_detail(r):
+    """Generate 漏洞详情 description text from scan result."""
+    product = r.get("product", "")
+    cve = r.get("cve_id", "")
+    vuln_type = r.get("vuln_type", "安全漏洞")
+    vuln_name = r.get("vuln_name", "")
+    version = r.get("version", "")
+
+    parts = []
+    if product:
+        parts.append(f"{product}")
+        if version:
+            parts.append(f" {version}")
+        parts.append(f" 存在{vuln_type}")
+    else:
+        parts.append(f"目标服务存在{vuln_type}")
+
+    if cve:
+        parts.append(f"（{cve}）")
+
+    if vuln_name and vuln_name != product:
+        parts.append(f"，{vuln_name}")
+
+    parts.append("。")
+
+    reasoning = r.get("reasoning", "")
+    if reasoning:
+        parts.append(reasoning[:200])
+
+    return "".join(parts)
+
+
+def _build_poc_text(r):
+    """Generate 漏洞的POC field — executable curl command + explanation."""
+    host = r.get("host", "")
+    evidence = r.get("evidence", "")
+
+    # Extract curl command from evidence
+    curl_cmd = ""
+    m = re.search(r'(curl\s+.+?)(?:\n|$)', evidence)
+    if m:
+        curl_cmd = m.group(1).strip()
+        curl_cmd = re.sub(r'http://127\.0\.0\.1:\d+', f'http://{host}', curl_cmd)
+
+    if not curl_cmd:
+        cve = r.get("cve_id", "")
+        curl_cmd = f'curl -s -i http://{host}/'
+
+    vuln_type = r.get("vuln_type", "安全漏洞")
+    cve = r.get("cve_id", "")
+    product = r.get("product", "目标服务")
+    explanation = f"# 说明: 向 {product} 发送探测请求验证 {cve or vuln_type} 漏洞。"
+
+    return f"{curl_cmd}\n\n{explanation}"
+
+
 def format_output(results):
+    """Format results into official competition output format."""
     rows = []
     seq = 0
     for r in results:
         if not r.get("has_vuln"):
             continue
         seq += 1
-        cve = r.get("cve_id", "")
-        name = r.get("vuln_name", "安全漏洞")
-        asset = f"{r['url']} 存在{cve} {name}" if cve else f"{r['url']} 存在{name}"
         rows.append({
             "序号": seq,
-            "目标资产": asset,
-            "是否存在漏洞": "是",
+            "访问地址": r["url"],
+            "漏洞编号": r.get("cve_id", ""),
             "漏洞类型": r.get("vuln_type", "安全漏洞"),
-            "漏洞编号": cve,
-            "漏洞验证描述": r.get("evidence", ""),
+            "漏洞详情": _build_vuln_detail(r),
+            "漏洞的POC": _build_poc_text(r),
             "token": r["token"],
         })
     return rows
 
 
 def save_results(output_rows, all_results, results_dir, elapsed, logger):
-    # scan_results.json FIRST
+    # scan_results.json FIRST (internal detailed format)
     scan_json = os.path.join(results_dir, "scan_results.json")
     with open(scan_json, "w", encoding="utf-8") as f:
         json.dump({
             "scan_time": datetime.now().isoformat(),
-            "method": "competition_scanner (6-layer fused architecture)",
+            "method": "competition_scanner (KAG-Blackbox)",
             "llm_model": LLM_MODEL,
             "total_targets": len(all_results),
             "nuclei_trust": sum(1 for r in all_results if "NUCLEI" in r.get("pipeline", "")),
@@ -1072,17 +1279,17 @@ def save_results(output_rows, all_results, results_dir, elapsed, logger):
         }, f, ensure_ascii=False, indent=2)
     logger.info(f"Scan results: {scan_json}")
 
-    # Competition JSON
+    # Competition output (official format)
     comp_json = os.path.join(results_dir, "competition_output.json")
     comp_data = [{k: v for k, v in row.items() if k != "token"} for row in output_rows]
     with open(comp_json, "w", encoding="utf-8") as f:
         json.dump(comp_data, f, ensure_ascii=False, indent=2)
     logger.info(f"Competition JSON: {comp_json} ({len(comp_data)} entries)")
 
-    # Competition CSV
+    # Competition CSV (official format)
     csv_file = os.path.join(results_dir, "competition_output.csv")
     if output_rows:
-        fields = ["序号", "目标资产", "是否存在漏洞", "漏洞类型", "漏洞编号", "漏洞验证描述"]
+        fields = ["序号", "访问地址", "漏洞编号", "漏洞类型", "漏洞详情", "漏洞的POC"]
         clean_rows = []
         for row in output_rows:
             clean = {}
@@ -1097,6 +1304,22 @@ def save_results(output_rows, all_results, results_dir, elapsed, logger):
             writer.writeheader()
             writer.writerows(clean_rows)
         logger.info(f"Competition CSV: {csv_file}")
+
+    # Competition XLSX (official format)
+    try:
+        import openpyxl
+        xlsx_file = os.path.join(results_dir, "competition_output.xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        headers = ["序号", "访问地址", "漏洞编号", "漏洞类型", "漏洞详情", "漏洞的POC"]
+        ws.append(headers)
+        for row in output_rows:
+            ws.append([row.get(h, "") for h in headers])
+        wb.save(xlsx_file)
+        logger.info(f"Competition XLSX: {xlsx_file}")
+    except ImportError:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -42,7 +42,10 @@ def main():
     parser.add_argument("--readmes", default=VULHUB_READMES_DIR)
     parser.add_argument("--fingerprints",
                         default="/data/lqy/framework/blackbox-docker/vulhub_fingerprints",
-                        help="Path to vulhub_fingerprints JSON directory")
+                        help="Path to vulhub_fingerprints JSON directory (highest priority)")
+    parser.add_argument("--surper-nuclei",
+                        default="",
+                        help="Path to surper-666 nuclei templates directory (highest priority)")
     parser.add_argument("--other-vul",
                         default="",
                         help="Path to other_vul.zip (low-priority supplementary templates)")
@@ -87,8 +90,13 @@ def main():
     else:
         log.info("Phase 3: Skipped (--no-vulhub-mapping)")
 
-    log.info("Phase 4: Vulhub fingerprints (high-precision, priority=2)")
+    log.info("Phase 4: Surper-666 fingerprints (highest priority=2)")
     n_fp = build_from_vulhub_fingerprints(driver, args.fingerprints)
+
+    if args.surper_nuclei:
+        log.info("Phase 4a: Surper-666 Nuclei templates (highest priority=2)")
+        n_sp, n_sp_cve, n_sp_poc, n_sp_fp = build_from_nuclei(driver, args.surper_nuclei)
+        log.info(f"  Products: {n_sp}, CVEs: {n_sp_cve}, PoCs: {n_sp_poc}, Fingerprints: {n_sp_fp}")
 
     if args.other_vul:
         log.info("Phase 4.5: Other vulnerability templates (low-priority, priority=0)")

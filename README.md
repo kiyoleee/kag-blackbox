@@ -94,13 +94,15 @@ pip install -r requirements.txt
 ### 2. 构建知识图谱
 
 ```bash
-# 解压指纹数据
-cd fingerprints && unzip vulhub_fingerprints.zip && cd ..
+# 解压数据
+cd fingerprints && unzip surper-666.zip && unzip other_vul.zip && cd ..
 
 # 构建 KG (需要 Neo4j 运行中)
 python3 kag_blackbox/builder/build_kg.py \
     --nuclei-dir /path/to/nuclei-templates \
-    --fingerprints fingerprints/vulhub_fingerprints \
+    --fingerprints fingerprints/surper-666/vulhub_fingerprints \
+    --surper-nuclei fingerprints/surper-666/nuclei \
+    --other-vul fingerprints/other_vul.zip \
     --no-vulhub-mapping \
     --clear
 ```
@@ -182,29 +184,29 @@ NEO4J_PASSWORD = "neo4j@openspg"
 
 ## 输出格式
 
-符合 CNCERT 比赛要求:
+符合 CNCERT 比赛官方样例 (`网络服务-测试样例-输出结果.xlsx`):
 
 | 字段 | 说明 | 示例 |
 |------|------|------|
 | 序号 | 自然数 | 1 |
-| 目标资产 | URL + CVE + 漏洞名 | `http://x.x.x.x 存在CVE-2024-36401 GeoServer ssti` |
-| 是否存在漏洞 | 是/否 | 是 |
-| 漏洞类型 | 漏洞分类 | 模板注入漏洞 |
-| 漏洞编号 | CVE编号 | CVE-2024-36401 |
-| 漏洞验证描述 | 多步骤PoC验证 | 第1步: 发送探测请求... 第2步: 指纹确认... |
+| 访问地址 | 目标 URL | `http://192.168.10.6:8001` |
+| 漏洞编号 | CVE 编号 | CVE-2025-29927 |
+| 漏洞类型 | 漏洞分类 | 鉴权绕过 |
+| 漏洞详情 | 漏洞描述 | Next.js 中间件存在鉴权绕过漏洞... |
+| 漏洞的POC | 可执行 curl 命令 | `curl -H "X-Middleware-Subrequest: middleware" http://...` |
 
 输出文件:
 - `scan_results.json` — 详细扫描结果
-- `competition_output.json` — 比赛格式 JSON
 - `competition_output.csv` — 比赛格式 CSV
+- `competition_output.xlsx` — 比赛格式 Excel (如有 openpyxl)
 
 ## 数据源与优先级
 
 | 优先级 | 数据源 | 来源 | 数量 |
 |--------|--------|------|------|
-| ★★★ | vulhub_fingerprints | 手工标注, 精确检测规则 | 328 CVE |
-| ★★ | Nuclei 官方模板 | 社区维护 | 4143 CVE |
-| ★ | 补充模板 (other_vul) | 混合来源 | 17127 CVE |
+| ★★★ | surper-666 | 手工标注指纹 + 定制 Nuclei 模板 | 4946 文件 |
+| ★★ | Nuclei 官方模板 | 社区维护 | ~11000 模板 |
+| ★ | other_vul | 混合来源（已清洗） | ~8000 CVE |
 
 KAG-Thinker 在推理时会标注候选 CVE 的数据源，优先采信高优先级来源。
 

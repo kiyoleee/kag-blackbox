@@ -177,6 +177,7 @@ def _format_fingerprint(fingerprint):
 
 
 _SOURCE_LABELS = {
+    "surper-666": "★★★ Surper-666 高精度数据（优先采信）",
     "vulhub_fingerprints": "★★★ 高精度指纹库（优先采信）",
     "nuclei": "★★ Nuclei官方模板",
     "other_vul": "★ 补充模板（仅供参考，可信度低）",
