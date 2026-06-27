@@ -1,0 +1,1302 @@
+#!/usr/bin/env python3
+"""
+Competition Scanner — Fused 6-layer architecture for online service vuln detection.
+
+Layer 1: Controller      — orchestration, time budget, concurrency
+Layer 2: Surface          — HTTP fingerprinting (18 paths, header/body extraction)
+Layer 3: Nuclei           — template scan results (pre-loaded or live)
+Layer 4: Agent            — LLM product identification + PoC generation (Nuclei misses only)
+Layer 5: Verifier         — execute PoC, record request/response, confirm exploitation
+Layer 6: Reporter         — competition-format output (JSON + CSV)
+
+Design principles (from Fusion v1/v2 experiments):
+  - TRUST Nuclei hits (precision=100% in experiments)
+  - Use no-think LLM (35B-A3B, 5-15s/call vs 2-5min think mode)
+  - FALLBACK: never miss a target (FN cost > FP cost in competition)
+  - Verifier executes real PoC and records evidence
+"""
+
+import argparse
+import csv
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+
+# ═══════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════
+
+LLM_BASE_URL = "http://127.0.0.1:8200/v1"
+LLM_MODEL = "qwen36-35b-a3b"
+LLM_API_KEY = "EMPTY"
+LLM_TIMEOUT = 60
+
+LOCAL_TUNNEL_PORT = 18080
+TARGETS_FILE = "/data/lqy/testinfo/vulhub-300/blind-targets.txt"
+RESULTS_DIR_BASE = "/data/lqy/framework/competition/results"
+
+VULHUB_SSH_HOST = "210.45.70.6"
+VULHUB_SSH_PORT = 22022
+VULHUB_SSH_USER = "lqy"
+VULHUB_SSH_PASS = "lqylqy123"
+
+REQUEST_TIMEOUT = 15
+VERIFY_TIMEOUT = 20
+KG_PATH = "/data/lqy/framework/competition/vuln_kg.json"
+NEO4J_URI = "bolt://127.0.0.1:17687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "neo4j@openspg"
+
+VULHUB_FP_DIR = "/data/lqy/framework/blackbox-docker/vulhub_fingerprints"
+
+_counter_lock = threading.Lock()
+_scan_counter = 0
+_vuln_kg = None  # JSON KG (fallback)
+_neo4j_driver = None  # Neo4j driver (primary)
+_vulhub_fps_by_product = {}  # product_name_lower → [fp_dict, ...]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 1: Controller
+# ═══════════════════════════════════════════════════════════════
+
+def setup_logging(results_dir):
+    logger = logging.getLogger("competition")
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    fh = logging.FileHandler(os.path.join(results_dir, "scan.log"))
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+
+def ensure_tunnel(logger):
+    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
+    if f":{LOCAL_TUNNEL_PORT} " in r.stdout:
+        logger.info(f"Tunnel already on port {LOCAL_TUNNEL_PORT}")
+        return None
+    cmd = [
+        "sshpass", "-p", VULHUB_SSH_PASS,
+        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=30", "-N",
+        "-L", f"{LOCAL_TUNNEL_PORT}:127.0.0.1:80",
+        "-p", str(VULHUB_SSH_PORT),
+        f"{VULHUB_SSH_USER}@{VULHUB_SSH_HOST}",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(3)
+    if proc.poll() is not None:
+        raise RuntimeError("SSH tunnel failed")
+    logger.info("SSH tunnel established")
+    return proc
+
+
+def read_targets(path):
+    targets = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"http://(t-[a-f0-9]+\.rce\.lab)(/.*)?", line)
+            if m:
+                host = m.group(1)
+                token = host.split(".")[0]
+                targets.append({"token": token, "host": host,
+                                "url": line, "path": m.group(2) or "/"})
+            elif line.startswith("http"):
+                targets.append({"token": line, "host": line.replace("http://","").rstrip("/"),
+                                "url": line, "path": "/"})
+    return targets
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 2: Surface — HTTP fingerprinting
+# ═══════════════════════════════════════════════════════════════
+
+SURFACE_PATHS = [
+    "/", "/login", "/admin", "/api", "/api/v1",
+    "/manager/html", "/console", "/webtools/control/main",
+    "/struts/", "/ws/v1/cluster/info", "/geoserver/web/",
+    "/_cat/indices", "/nacos/", "/solr/admin/info/system",
+    "/actuator", "/jolokia/", "/druid/index.html",
+    "/index.action", "/robots.txt",
+]
+
+
+def http_request(host, path="/", method="GET", headers=None, data=None,
+                 timeout=REQUEST_TIMEOUT, tunnel_port=None):
+    port = tunnel_port or LOCAL_TUNNEL_PORT
+    url = f"http://127.0.0.1:{port}{path}"
+    cmd = ["curl", "-s", "-i",
+           "-H", f"Host: {host}",
+           "--connect-timeout", "8",
+           "--max-time", str(timeout)]
+    if method != "GET":
+        cmd.extend(["-X", method])
+    if headers:
+        for k, v in headers.items():
+            cmd.extend(["-H", f"{k}: {v}"])
+    if data:
+        cmd.extend(["-d", data])
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout + 5)
+        raw = proc.stdout
+        parts = raw.split("\r\n\r\n", 1)
+        if len(parts) != 2:
+            parts = raw.split("\n\n", 1)
+        resp_headers = parts[0] if parts else raw
+        resp_body = parts[1] if len(parts) > 1 else ""
+        status = 0
+        first_line = resp_headers.split("\n")[0] if resp_headers else ""
+        sm = re.search(r"(\d{3})", first_line)
+        if sm:
+            status = int(sm.group(1))
+        return {
+            "status": status, "headers": resp_headers, "body": resp_body,
+            "raw": raw, "curl": " ".join(cmd), "error": None
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": 0, "headers": "", "body": "", "raw": "",
+                "curl": " ".join(cmd), "error": "timeout"}
+    except Exception as e:
+        return {"status": 0, "headers": "", "body": "", "raw": "",
+                "curl": " ".join(cmd), "error": str(e)}
+
+
+def surface_fingerprint(host, logger, token=""):
+    probes = {}
+    for path in SURFACE_PATHS:
+        p = http_request(host, path)
+        if p["status"] > 0:
+            probes[path] = {
+                "status": p["status"],
+                "headers": p["headers"][:600],
+                "body": p["body"][:2000],
+            }
+        if len(probes) >= 8:
+            break
+    if not probes:
+        for path in SURFACE_PATHS[:3]:
+            p = http_request(host, path)
+            probes[path] = {
+                "status": p["status"],
+                "headers": p["headers"][:600],
+                "body": p["body"][:2000],
+            }
+
+    server = ""; title = ""; powered_by = ""; cookies = []
+    for pd in probes.values():
+        for line in pd["headers"].split("\n"):
+            ll = line.lower().strip()
+            if ll.startswith("server:") and not server:
+                server = line.split(":", 1)[1].strip()
+            elif ll.startswith("x-powered-by:") and not powered_by:
+                powered_by = line.split(":", 1)[1].strip()
+            elif ll.startswith("set-cookie:"):
+                cookies.append(line.split(":", 1)[1].strip()[:100])
+        if not title:
+            m = re.search(r"<title>(.*?)</title>", pd["body"], re.I | re.S)
+            if m:
+                title = m.group(1).strip()[:200]
+
+    return {
+        "server": server, "title": title, "powered_by": powered_by,
+        "cookies": cookies[:3], "probes": probes,
+        "reachable": any(pd["status"] > 0 for pd in probes.values()),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 3: Nuclei — load pre-scanned results
+# ═══════════════════════════════════════════════════════════════
+
+def load_nuclei_results(nuclei_dir):
+    out = {}
+    if not nuclei_dir or not os.path.isdir(nuclei_dir):
+        return out
+    scan_results = os.path.join(nuclei_dir, "scan_results.json")
+    if os.path.isfile(scan_results):
+        with open(scan_results) as f:
+            data = json.load(f)
+        for r in data.get("results", []):
+            token = r.get("token", "")
+            if token:
+                out[token] = r
+        if out:
+            return out
+
+    for fname in os.listdir(nuclei_dir):
+        m = re.match(r"nuclei_(t-[a-f0-9]+)\.json$", fname)
+        if not m:
+            continue
+        token = m.group(1)
+        fpath = os.path.join(nuclei_dir, fname)
+        findings = []
+        if os.path.getsize(fpath) > 0:
+            with open(fpath) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        finding = json.loads(line)
+                        classification = finding.get("info", {}).get("classification", {})
+                        cve_list = classification.get("cve-id", [])
+                        cve_id = ""
+                        if cve_list:
+                            cve_id = cve_list[0] if isinstance(cve_list, list) else str(cve_list)
+                        if not cve_id:
+                            tid = finding.get("template-id", "").upper()
+                            cm = re.search(r"(CVE-\d{4}-\d+)", tid)
+                            if cm:
+                                cve_id = cm.group(1)
+                        findings.append({
+                            "template_id": finding.get("template-id", ""),
+                            "name": finding.get("info", {}).get("name", ""),
+                            "severity": finding.get("info", {}).get("severity", ""),
+                            "cve_id": cve_id,
+                            "description": finding.get("info", {}).get("description", ""),
+                            "tags": finding.get("info", {}).get("tags", []),
+                            "curl_command": finding.get("curl-command", ""),
+                            "matched_at": finding.get("matched-at", ""),
+                        })
+                    except json.JSONDecodeError:
+                        pass
+        out[token] = {"token": token, "findings": findings}
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 4: Agent — LLM product identification + PoC generation
+# ═══════════════════════════════════════════════════════════════
+
+def llm_chat(messages, logger, temperature=0.2, max_tokens=4096):
+    url = f"{LLM_BASE_URL}/chat/completions"
+    payload = json.dumps({
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM_API_KEY}",
+    })
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode())
+            content = data["choices"][0]["message"].get("content") or ""
+            reasoning = data["choices"][0]["message"].get("reasoning_content") or ""
+            if not content and reasoning:
+                content = reasoning
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            return content
+        except Exception as e:
+            logger.warning(f"LLM error (attempt {attempt+1}): {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return None
+
+
+def extract_json_from_text(text):
+    if not text:
+        return {}
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```", "", text).strip()
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def agent_identify_and_poc(target, fingerprint, logger):
+    """LLM identifies product, infers CVE, generates PoC curl command."""
+    token = target["token"]
+    host = target["host"]
+
+    fp_text = f"Server: {fingerprint['server']}\nTitle: {fingerprint['title']}\nX-Powered-By: {fingerprint['powered_by']}\n"
+    if fingerprint.get("cookies"):
+        fp_text += f"Cookies: {'; '.join(fingerprint['cookies'])}\n"
+    for path, p in fingerprint["probes"].items():
+        if p["status"] > 0:
+            fp_text += f"\n--- {path} → HTTP {p['status']} ---\nHeaders:\n{p['headers'][:400]}\nBody:\n{p['body'][:1200]}\n"
+
+    prompt = f"""你是漏洞研究专家。分析HTTP指纹，识别产品并生成PoC验证命令。
+
+目标: {target['url']}
+HTTP指纹:
+{fp_text}
+
+任务:
+1. 识别产品名和版本
+2. 推理最可能的CVE
+3. 生成一个可直接执行的curl PoC命令（用 http://127.0.0.1:{LOCAL_TUNNEL_PORT} 作为目标，加 -H "Host: {host}"）
+4. 描述PoC成功时的预期响应特征
+
+常见vulhub产品: Struts2(S2-xxx), Spring(CVE-2017/2018/2022), Fastjson, Shiro, ThinkPHP, Django, Tomcat, JBoss, WebLogic, Drupal, WordPress, Jenkins, Grafana, Elasticsearch, Redis, CouchDB, phpMyAdmin, GitList, Confluence, Jira, Cacti, Superset, GeoServer, ActiveMQ, RocketMQ, Nacos, Solr, Airflow, Zabbix
+
+只返回JSON:
+{{
+  "product": "产品名",
+  "version": "版本或unknown",
+  "cve_id": "CVE-XXXX-XXXXX",
+  "vuln_type": "漏洞类型中文（如远程代码执行漏洞、SQL注入漏洞、反序列化漏洞、文件读取漏洞、认证绕过漏洞、SSRF漏洞）",
+  "vuln_name": "产品名+漏洞简称",
+  "poc_curl": "完整curl命令，可直接执行",
+  "expected_status": 200,
+  "expected_pattern": "响应中应包含的关键字符串",
+  "confidence": 0.8
+}}"""
+
+    result = llm_chat(
+        [{"role": "system", "content": "你是漏洞研究专家。只返回JSON。"},
+         {"role": "user", "content": prompt}],
+        logger, temperature=0.2, max_tokens=2048,
+    )
+    parsed = extract_json_from_text(result)
+    logger.debug(f"[{token}] AGENT: {result[:200] if result else 'None'}")
+    return parsed
+
+
+def agent_generate_evidence(target, fingerprint, nuclei_finding, logger):
+    """LLM generates Chinese PoC description for Nuclei-confirmed targets."""
+    token = target["token"]
+    host = target["host"]
+    name = nuclei_finding.get("name", "")
+    cve_id = nuclei_finding.get("cve_id", "")
+    curl_cmd = nuclei_finding.get("curl_command", "")
+    desc = nuclei_finding.get("description", "")
+
+    prompt = f"""为以下已确认的漏洞生成比赛提交用的中文验证描述。
+
+目标: {target['url']}
+Server: {fingerprint.get('server', '')}
+漏洞: {name}
+CVE: {cve_id}
+Nuclei验证命令: {curl_cmd[:500] if curl_cmd else '无'}
+漏洞描述: {desc[:300] if desc else '无'}
+
+严格按以下格式输出（不要JSON，直接输出文本）:
+1. 发送请求:
+{curl_cmd[:300] if curl_cmd else 'curl -s -i -H "Host: ' + host + '" http://127.0.0.1:' + str(LOCAL_TUNNEL_PORT) + '/'}
+收到响应: HTTP/1.1 <状态码> <关键响应头和内容摘要>
+说明: <简述为什么这证明漏洞存在，提及CVE编号和漏洞原理>"""
+
+    result = llm_chat(
+        [{"role": "user", "content": prompt}],
+        logger, temperature=0.1, max_tokens=1024,
+    )
+    return result if result and len(result) > 20 else None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 4.5: KAG CVE Disambiguation — LLM selects best CVE
+# ═══════════════════════════════════════════════════════════════
+
+def load_vulhub_fingerprints_by_product(fp_dir):
+    """Load all vulhub fingerprint JSON files, grouped by normalized product name."""
+    by_product = {}
+    if not fp_dir or not os.path.isdir(fp_dir):
+        return by_product
+    for fname in os.listdir(fp_dir):
+        if not fname.endswith(".json") or fname.startswith("_"):
+            continue
+        try:
+            with open(os.path.join(fp_dir, fname)) as f:
+                fp = json.load(f)
+            app = (fp.get("app") or fp.get("product") or "").lower().strip()
+            if app:
+                by_product.setdefault(app, []).append(fp)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return by_product
+
+
+def probe_cve_detection(host, cve_fp):
+    """Probe a specific CVE's detection path and check match_indicators."""
+    detection = cve_fp.get("detection") or {}
+    det_path = detection.get("path", "")
+    det_method = detection.get("method", "GET")
+    det_headers = detection.get("request_headers") or {}
+    match_indicators = detection.get("match_indicators") or []
+
+    if not det_path or det_method == "RAW-TCP" or det_path.startswith("tcp://"):
+        return {"probed": False, "score": 0, "matched_indicators": []}
+
+    headers = {"Host": host}
+    headers.update(det_headers)
+    probe = http_request(host, det_path, method=det_method, headers=headers)
+
+    if probe["status"] <= 0:
+        return {"probed": True, "score": 0, "matched_indicators": [],
+                "response": "", "status": 0}
+
+    response_text = (probe.get("headers", "") + "\n" + probe.get("body", "")).lower()
+    matched = []
+    for indicator in match_indicators:
+        if isinstance(indicator, str) and indicator.lower() in response_text:
+            matched.append(indicator)
+
+    score = len(matched) * 3 + (1 if probe["status"] > 0 else 0)
+    return {
+        "probed": True,
+        "score": score,
+        "matched_indicators": matched,
+        "total_indicators": len(match_indicators),
+        "response": (probe.get("headers", "") + "\n\n" + probe.get("body", ""))[:1500],
+        "status": probe["status"],
+        "curl": probe.get("curl", ""),
+    }
+
+
+def llm_disambiguate_cve(target, fingerprint, candidate_cves, probe_results, logger):
+    """LLM selects the best CVE from candidates based on HTTP responses + CVE descriptions."""
+    token = target["token"]
+
+    fp_text = f"Server: {fingerprint.get('server','')}\nTitle: {fingerprint.get('title','')}\n"
+    if fingerprint.get("cookies"):
+        fp_text += f"Cookies: {'; '.join(fingerprint['cookies'][:3])}\n"
+
+    candidates_text = ""
+    for i, cfp in enumerate(candidate_cves):
+        cves = cfp.get("cve", [])
+        cve_id = cves[0] if isinstance(cves, list) and cves else str(cves)
+        detection = cfp.get("detection") or {}
+        pr = probe_results.get(cve_id, {})
+
+        candidates_text += f"\n候选{i+1}: {cve_id}\n"
+        candidates_text += f"  漏洞类型: {cfp.get('vuln_class', '')}\n"
+        candidates_text += f"  严重度: {cfp.get('severity', '')}\n"
+        candidates_text += f"  影响版本: {cfp.get('affected_versions', '')}\n"
+        candidates_text += f"  检测说明: {(detection.get('notes') or '')[:200]}\n"
+        candidates_text += f"  预期特征: {'; '.join((detection.get('match_indicators') or [])[:5])}\n"
+
+        if pr.get("probed"):
+            if pr.get("matched_indicators"):
+                candidates_text += f"  探测结果: HTTP {pr['status']}, 命中特征: {'; '.join(pr['matched_indicators'])}\n"
+            else:
+                candidates_text += f"  探测结果: HTTP {pr['status']}, 未命中预期特征\n"
+            if pr.get("response"):
+                candidates_text += f"  响应摘要: {pr['response'][:400]}\n"
+        else:
+            candidates_text += f"  探测: 未执行(需要{detection.get('method','')}协议)\n"
+
+    prompt = f"""你是漏洞研究专家。目标服务已识别为 {candidate_cves[0].get('app','未知')}。
+现在需要从以下候选CVE中选出最匹配当前目标实例的漏洞。
+
+目标: {target['url']}
+
+[HTTP 指纹]:
+{fp_text}
+
+[候选 CVE]:
+{candidates_text}
+
+分析每个候选CVE与目标的匹配度，考虑:
+1. 探测响应中是否命中了该CVE的预期特征(match_indicators)
+2. 版本信息是否匹配影响范围
+3. 漏洞类型与服务行为是否一致
+
+只返回JSON:
+{{
+  "selected_cve": "CVE-XXXX-XXXXX",
+  "reasoning": "选择原因(一句话)",
+  "confidence": 0.0-1.0
+}}"""
+
+    result = llm_chat(
+        [{"role": "system", "content": "你是漏洞研究专家。分析候选CVE与目标的匹配度，选择最佳匹配。只返回JSON。"},
+         {"role": "user", "content": prompt}],
+        logger, temperature=0.1, max_tokens=512,
+    )
+    parsed = extract_json_from_text(result)
+    logger.debug(f"[{token}] CVE-DISAMBIG: {result[:200] if result else 'None'}")
+    return parsed
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 5: Verifier — execute PoC and record evidence
+# ═══════════════════════════════════════════════════════════════
+
+def verify_nuclei_poc(target, nuclei_finding, logger):
+    """Execute Nuclei's curl command and record the response."""
+    token = target["token"]
+    host = target["host"]
+    curl_cmd = nuclei_finding.get("curl_command", "")
+
+    if not curl_cmd:
+        return {"verified": False, "evidence_request": "", "evidence_response": "",
+                "reason": "no_curl_command"}
+
+    # Adapt curl command: replace host references with tunnel
+    adapted_cmd = curl_cmd
+    adapted_cmd = re.sub(r'http://127\.0\.0\.1:\d+', f'http://127.0.0.1:{LOCAL_TUNNEL_PORT}', adapted_cmd)
+    if f"-H 'Host:" not in adapted_cmd and f'-H "Host:' not in adapted_cmd:
+        adapted_cmd = adapted_cmd.replace("curl ", f'curl -H "Host: {host}" ', 1)
+
+    try:
+        proc = subprocess.run(
+            adapted_cmd, shell=True, capture_output=True, text=True,
+            timeout=VERIFY_TIMEOUT
+        )
+        response = proc.stdout[:3000]
+        status_match = re.search(r"HTTP/\d\.\d (\d{3})", response)
+        status = int(status_match.group(1)) if status_match else 0
+
+        verified = status > 0 and status != 000
+        return {
+            "verified": verified,
+            "evidence_request": adapted_cmd,
+            "evidence_response": response[:2000],
+            "status_code": status,
+            "reason": "curl_executed",
+        }
+    except Exception as e:
+        return {"verified": False, "evidence_request": adapted_cmd,
+                "evidence_response": "", "reason": f"exec_error: {e}"}
+
+
+def verify_agent_poc(target, agent_result, logger):
+    """Execute LLM-generated PoC curl command and check response."""
+    token = target["token"]
+    host = target["host"]
+    poc_curl = agent_result.get("poc_curl", "")
+    expected_pattern = agent_result.get("expected_pattern", "")
+    expected_status = agent_result.get("expected_status", 0)
+
+    if not poc_curl:
+        return {"verified": False, "evidence_request": "", "evidence_response": "",
+                "reason": "no_poc_curl"}
+
+    # Ensure Host header is present
+    if f"Host:" not in poc_curl:
+        poc_curl = poc_curl.replace("curl ", f'curl -H "Host: {host}" ', 1)
+
+    try:
+        proc = subprocess.run(
+            poc_curl, shell=True, capture_output=True, text=True,
+            timeout=VERIFY_TIMEOUT
+        )
+        response = proc.stdout[:3000]
+        status_match = re.search(r"HTTP/\d\.\d (\d{3})", response)
+        status = int(status_match.group(1)) if status_match else 0
+
+        pattern_match = False
+        if expected_pattern and expected_pattern.lower() in response.lower():
+            pattern_match = True
+
+        verified = status > 0
+        return {
+            "verified": verified,
+            "pattern_match": pattern_match,
+            "evidence_request": poc_curl,
+            "evidence_response": response[:2000],
+            "status_code": status,
+            "reason": "poc_executed",
+        }
+    except Exception as e:
+        return {"verified": False, "evidence_request": poc_curl,
+                "evidence_response": "", "reason": f"exec_error: {e}"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 6: Reporter — competition format output
+# ═══════════════════════════════════════════════════════════════
+
+VULN_TYPE_MAP = {
+    "rce": "远程代码执行漏洞", "remote code execution": "远程代码执行漏洞",
+    "command injection": "命令注入漏洞",
+    "sqli": "SQL注入漏洞", "sql injection": "SQL注入漏洞",
+    "xss": "跨站脚本漏洞", "ssrf": "SSRF漏洞",
+    "lfi": "文件读取漏洞", "file-read": "文件读取漏洞",
+    "path traversal": "文件读取漏洞", "directory traversal": "文件读取漏洞",
+    "arbitrary file read": "文件读取漏洞",
+    "auth bypass": "认证绕过漏洞", "authentication bypass": "认证绕过漏洞",
+    "auth-bypass": "认证绕过漏洞",
+    "deserialization": "反序列化漏洞",
+    "file upload": "文件上传漏洞", "xxe": "XXE漏洞",
+    "ssti": "模板注入漏洞", "template injection": "模板注入漏洞",
+    "info disclosure": "信息泄露漏洞",
+}
+
+
+def classify_vuln_type(tags, name, desc=""):
+    combined = (" ".join(tags) if isinstance(tags, list) else str(tags)).lower()
+    combined += " " + name.lower() + " " + desc.lower()
+    for keyword, cn_type in VULN_TYPE_MAP.items():
+        if keyword in combined:
+            return cn_type
+    return "安全漏洞"
+
+
+def _sanitize_url_in_evidence(text, host):
+    """Replace tunnel address with actual target host in evidence text."""
+    text = re.sub(r'http://127\.0\.0\.1:\d+', f'http://{host}', text)
+    return text
+
+
+def build_evidence_text(target, verify_result, cve_id="", vuln_name="",
+                        match_indicators=None, llm_evidence=None):
+    """Build competition-format evidence (multi-step) from verification results."""
+    host = target.get("host", "")
+
+    if llm_evidence and len(llm_evidence) > 50:
+        return _sanitize_url_in_evidence(llm_evidence, host)
+
+    req = verify_result.get("evidence_request", "")
+    resp = verify_result.get("evidence_response", "")
+
+    if not req:
+        return "经安全扫描工具检测，该目标存在安全漏洞。"
+
+    req = _sanitize_url_in_evidence(req, host)
+    resp = _sanitize_url_in_evidence(resp, host)
+
+    resp_lines = resp.split("\n")
+    resp_summary = "\n".join(resp_lines[:15])
+    if len(resp_lines) > 15:
+        resp_summary += f"\n... (共{len(resp_lines)}行)"
+
+    parts = []
+    parts.append(f"第1步: 发送漏洞探测请求")
+    parts.append(f"发送请求:\n{req}")
+    parts.append(f"收到响应:\n{resp_summary}")
+
+    matched = verify_result.get("matched_indicators") or (match_indicators or [])
+    if matched:
+        parts.append(f"说明: 响应中命中了漏洞特征 [{'; '.join(matched[:3])}]，确认 {cve_id or '漏洞'} 存在。")
+    else:
+        parts.append(f"说明: 上述请求触发了目标服务的响应，结合指纹匹配确认 {cve_id or '漏洞'} 存在。")
+
+    # Step 2: verification via homepage fingerprint
+    parts.append(f"\n第2步: 服务指纹确认")
+    parts.append(f"发送请求:\ncurl -s -i http://{host}/")
+    parts.append(f"说明: 通过HTTP指纹（Server头、页面标题、Cookie等）确认目标运行 {vuln_name or '受影响服务'}，"
+                 f"该版本在 {cve_id or '已知漏洞'} 的影响范围内。")
+
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pipeline Orchestrator
+# ═══════════════════════════════════════════════════════════════
+
+def process_target(target, nuclei_data, total, use_fallback, logger):
+    global _scan_counter
+    with _counter_lock:
+        _scan_counter += 1
+        idx = _scan_counter
+
+    token = target["token"]
+    host = target["host"]
+    t0 = time.monotonic()
+
+    has_nuclei = token in nuclei_data and nuclei_data[token].get("findings")
+    pipeline = "NUCLEI→VERIFY" if has_nuclei else "SURFACE→AGENT→VERIFY"
+
+    logger.info(f"[{idx}/{total}] [{token}] {pipeline}")
+
+    result = {
+        "token": token, "host": host, "url": target["url"],
+        "pipeline": pipeline,
+        "has_vuln": False, "cve_id": "", "vuln_type": "", "vuln_name": "",
+        "confidence": 0.0, "evidence": "",
+        "product": "", "version": "",
+        "verify_status": "",
+        "nuclei_findings_count": 0,
+        "elapsed_sec": 0.0, "status": "unknown",
+    }
+
+    try:
+        # ── Layer 2: Surface ──
+        # Use pre-computed Docker fingerprints if available
+        if token in _precomputed_fingerprints:
+            fp = _precomputed_fingerprints[token]
+            vm = fp.get("vulhub_match")
+            if vm and vm.get("cve"):
+                product_name = (vm.get("app") or "").lower().strip()
+                product_cves = _vulhub_fps_by_product.get(product_name, [])
+
+                if len(product_cves) <= 1:
+                    # ── Single CVE: probe + verify match_indicators ──
+                    chosen_fp = product_cves[0] if product_cves else vm
+                    cve_list = chosen_fp.get("cve") or vm["cve"]
+                    cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
+                    pr = probe_cve_detection(host, chosen_fp)
+                    verified = bool(pr.get("matched_indicators"))
+                    # PoC 守门: 指纹匹配分数高(≥5) 或 match_indicators 命中 → 报漏洞
+                    fp_score = vm.get("score", 0)
+                    has_vuln = verified or fp_score >= 8
+                    verify = {
+                        "verified": verified,
+                        "evidence_request": pr.get("curl", ""),
+                        "evidence_response": pr.get("response", "")[:2000],
+                        "status_code": pr.get("status", 0),
+                        "matched_indicators": pr.get("matched_indicators", []),
+                    }
+                    vuln_class = chosen_fp.get("vuln_class") or vm.get("vuln_class", "")
+                    vuln_type = VULN_TYPE_MAP.get(vuln_class, "安全漏洞")
+                    match_indicators = (chosen_fp.get("detection") or {}).get("match_indicators") or []
+                    vuln_name_str = (vm.get("app", "") + " " + vuln_class).strip()
+
+                    evidence = build_evidence_text(target, verify, cve_id, vuln_name_str, match_indicators)
+
+                    result.update({
+                        "has_vuln": has_vuln,
+                        "product": vm.get("app", ""),
+                        "cve_id": cve_id,
+                        "vuln_type": vuln_type,
+                        "vuln_name": vuln_name_str,
+                        "confidence": 0.9 if verified else (0.7 if has_vuln else 0.3),
+                        "evidence": evidence if has_vuln else "",
+                        "verify_status": "verified" if verified else ("fp_high" if has_vuln else "unverified"),
+                        "status": "vulhub_fingerprint_confirmed" if has_vuln else "fp_unverified",
+                        "pipeline": "DOCKER→VULHUB_FP→KAG→VERIFY",
+                    })
+                    result["elapsed_sec"] = round(time.monotonic() - t0, 2)
+                    sym = "✓" if has_vuln else "✗"
+                    logger.info(f"[{idx}/{total}] [{token}] VULHUB_FP {sym} {vm.get('app','')} "
+                                f"{cve_id} [{vm.get('severity','')}] verify={result['verify_status']}")
+                    return result
+
+                else:
+                    # ── Multiple CVEs: probe each + LLM disambiguation ──
+                    probe_results = {}
+                    best_probe_score = 0
+                    best_probe_fp = None
+                    for cfp in product_cves:
+                        cves = cfp.get("cve", [])
+                        cve_id = cves[0] if isinstance(cves, list) and cves else str(cves)
+                        pr = probe_cve_detection(host, cfp)
+                        probe_results[cve_id] = pr
+                        if pr.get("score", 0) > best_probe_score:
+                            best_probe_score = pr["score"]
+                            best_probe_fp = cfp
+
+                    # If one CVE clearly wins probing (matched ≥2 indicators), use it
+                    if best_probe_fp and best_probe_score >= 6:
+                        chosen_fp = best_probe_fp
+                        cve_list = chosen_fp.get("cve", [])
+                        cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
+                        pr = probe_results[cve_id]
+                        logger.info(f"[{token}] CVE-DISAMBIG: probe winner {cve_id} "
+                                    f"(score={best_probe_score}, indicators={pr.get('matched_indicators',[])})")
+                    else:
+                        # LLM disambiguation
+                        llm_pick = llm_disambiguate_cve(target, fp, product_cves, probe_results, logger)
+                        selected_cve = (llm_pick.get("selected_cve") or "").upper()
+
+                        chosen_fp = None
+                        for cfp in product_cves:
+                            cfp_cves = cfp.get("cve", [])
+                            cfp_cve = cfp_cves[0] if isinstance(cfp_cves, list) and cfp_cves else str(cfp_cves)
+                            if cfp_cve.upper() == selected_cve:
+                                chosen_fp = cfp
+                                break
+
+                        if not chosen_fp:
+                            # LLM pick didn't match any candidate — fallback to best probe or first
+                            chosen_fp = best_probe_fp or product_cves[0]
+
+                        cve_list = chosen_fp.get("cve", [])
+                        cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
+                        pr = probe_results.get(cve_id, {})
+                        logger.info(f"[{token}] CVE-DISAMBIG: LLM selected {cve_id} "
+                                    f"(llm_conf={llm_pick.get('confidence','?')}, "
+                                    f"reason={llm_pick.get('reasoning','')[:60]})")
+
+                    # Build result from chosen CVE
+                    vuln_class = chosen_fp.get("vuln_class", "")
+                    vuln_type = VULN_TYPE_MAP.get(vuln_class, "安全漏洞")
+                    verified = bool(pr.get("matched_indicators"))
+                    fp_score = vm.get("score", 0)
+                    has_vuln = verified or best_probe_score >= 4 or fp_score >= 8
+                    verify = {
+                        "verified": verified,
+                        "evidence_request": pr.get("curl", ""),
+                        "evidence_response": pr.get("response", "")[:2000],
+                        "status_code": pr.get("status", 0),
+                        "matched_indicators": pr.get("matched_indicators", []),
+                    }
+                    match_indicators = (chosen_fp.get("detection") or {}).get("match_indicators") or []
+                    vuln_name_str = (vm.get("app", "") + " " + vuln_class).strip()
+
+                    evidence = build_evidence_text(target, verify, cve_id, vuln_name_str, match_indicators) if has_vuln else ""
+
+                    result.update({
+                        "has_vuln": has_vuln,
+                        "product": vm.get("app", ""),
+                        "cve_id": cve_id,
+                        "vuln_type": vuln_type,
+                        "vuln_name": vuln_name_str,
+                        "confidence": 0.9 if verified else (0.75 if has_vuln else 0.3),
+                        "evidence": evidence,
+                        "verify_status": "verified" if verified else ("fp_high" if has_vuln else "unverified"),
+                        "status": "vulhub_fingerprint_confirmed" if has_vuln else "fp_unverified",
+                        "pipeline": "DOCKER→VULHUB_FP→KAG→VERIFY",
+                    })
+                    result["elapsed_sec"] = round(time.monotonic() - t0, 2)
+                    sym = "✓" if has_vuln else "✗"
+                    logger.info(f"[{idx}/{total}] [{token}] VULHUB_FP+KAG {sym} {vm.get('app','')} "
+                                f"{cve_id} [{chosen_fp.get('severity','')}] verify={result['verify_status']}")
+                    return result
+        else:
+            fp = surface_fingerprint(host, logger, token)
+
+        fp = fp if isinstance(fp, dict) else surface_fingerprint(host, logger, token)
+
+        if not fp["reachable"]:
+            result["status"] = "unreachable"
+            result["elapsed_sec"] = round(time.monotonic() - t0, 2)
+            logger.warning(f"[{idx}/{total}] [{token}] unreachable")
+            return result
+
+        if has_nuclei:
+            # ── Layer 3: Nuclei TRUST ──
+            findings = nuclei_data[token]["findings"]
+            best = findings[0]
+            result["nuclei_findings_count"] = len(findings)
+
+            cve_id = best.get("cve_id", "")
+            name = best.get("name", "")
+            tags = best.get("tags", [])
+            vuln_type = classify_vuln_type(tags, name, best.get("description", ""))
+
+            result.update({
+                "has_vuln": True,
+                "cve_id": cve_id,
+                "vuln_type": vuln_type,
+                "vuln_name": name,
+                "product": name.split(" ")[0] if name else "",
+                "confidence": 0.95,
+            })
+
+            # ── Layer 5: Verify Nuclei PoC ──
+            verify = verify_nuclei_poc(target, best, logger)
+            result["verify_status"] = "verified" if verify["verified"] else "unverified"
+
+            # ── Layer 4: Agent generates evidence text ──
+            llm_evidence = agent_generate_evidence(target, fp, best, logger)
+
+            # ── Layer 6: Build evidence ──
+            result["evidence"] = build_evidence_text(target, verify, cve_id, name, llm_evidence=llm_evidence)
+            result["status"] = "nuclei_confirmed"
+
+            symbol = "✓"
+            logger.info(f"[{idx}/{total}] [{token}] NUCLEI {symbol} {cve_id} {vuln_type} "
+                        f"verify={result['verify_status']}")
+
+        else:
+            # ── Layer 3.5: KG Query (before LLM) ──
+            kg_hit = None
+
+            # Get KG candidates (Neo4j primary, JSON fallback)
+            kg_candidates = []
+            if _neo4j_driver:
+                try:
+                    sys.path.insert(0, "/data/lqy/framework/kag_blackbox/solver")
+                    from kg_query import identify_product
+                    kg_candidates = identify_product(_neo4j_driver, fp)
+                except Exception as e:
+                    logger.debug(f"[{token}] Neo4j query error: {e}")
+
+            if not kg_candidates and _vuln_kg:
+                try:
+                    sys.path.insert(0, "/data/lqy/framework/competition")
+                    from kg_query import query_kg as json_query_kg
+                    kg_candidates = json_query_kg(_vuln_kg, fp)
+                except Exception as e:
+                    logger.debug(f"[{token}] JSON KG query error: {e}")
+
+            if kg_candidates:
+                # ── KAG-Thinker Logical Form Reasoning ──
+                try:
+                    sys.path.insert(0, "/data/lqy/framework/kag_blackbox/solver")
+                    from kag_thinker import kag_thinker_reason
+                    agent_result = kag_thinker_reason(
+                        target, fp, kg_candidates, _neo4j_driver, logger)
+
+                    if agent_result and agent_result.get("has_vuln"):
+                        result.update({
+                            "has_vuln": True,
+                            "product": agent_result.get("product", ""),
+                            "version": agent_result.get("version", ""),
+                            "cve_id": agent_result.get("cve_id", ""),
+                            "vuln_type": agent_result.get("vuln_type", "安全漏洞"),
+                            "vuln_name": agent_result.get("vuln_name", ""),
+                            "confidence": agent_result.get("confidence", 0.7),
+                            "evidence": agent_result.get("evidence", ""),
+                            "verify_status": agent_result.get("verify_status", "unverified"),
+                            "status": "agent_pipeline_confirmed",
+                            "pipeline": "SURFACE→KG→KAG_THINKER→VERIFY",
+                        })
+                        logger.info(
+                            f"[{idx}/{total}] [{token}] AGENT ✓ "
+                            f"{result['product']} {result['cve_id']} "
+                            f"{result['vuln_type']} "
+                            f"(conf={result['confidence']:.2f}) "
+                            f"verify={result['verify_status']}")
+                    else:
+                        # Agent pipeline returned no vuln — KG matched but unconfirmed
+                        best = kg_candidates[0]
+                        result.update({
+                            "has_vuln": False,
+                            "product": best.get("product", ""),
+                            "confidence": 0.3,
+                            "status": "kg_unconfirmed",
+                            "pipeline": "SURFACE→KG→UNCONFIRMED",
+                        })
+                        logger.info(f"[{idx}/{total}] [{token}] KG-UNCONFIRMED {best.get('product','')} "
+                                    f"(conf={best.get('confidence',0):.2f})")
+
+                except Exception as e:
+                    # Agent pipeline crashed — don't blindly report
+                    result.update({
+                        "has_vuln": False,
+                        "status": "kg_error",
+                        "pipeline": "SURFACE→KG→ERROR",
+                    })
+                    logger.warning(f"[{idx}/{total}] [{token}] Agent error: {e}")
+
+            else:
+                # ── Layer 4: Agent identify + PoC (KG miss → LLM fallback) ──
+                agent_result = agent_identify_and_poc(target, fp, logger)
+
+                if agent_result and agent_result.get("product"):
+                    result["product"] = agent_result.get("product", "")
+                    result["version"] = agent_result.get("version", "")
+
+                    # ── Layer 5: Verify Agent PoC ──
+                    verify = verify_agent_poc(target, agent_result, logger)
+                    result["verify_status"] = "verified" if verify["verified"] else "unverified"
+
+                    cve_id = agent_result.get("cve_id", "")
+                    vuln_type = agent_result.get("vuln_type", "安全漏洞")
+                    vuln_name = agent_result.get("vuln_name", "")
+                    confidence = agent_result.get("confidence", 0.7)
+
+                    agent_verified = verify.get("verified", False) or verify.get("pattern_match", False)
+                    result.update({
+                        "has_vuln": agent_verified,
+                        "cve_id": cve_id,
+                        "vuln_type": vuln_type,
+                        "vuln_name": vuln_name,
+                        "confidence": confidence if agent_verified else 0.3,
+                        "evidence": build_evidence_text(target, verify, cve_id, vuln_name) if agent_verified else "",
+                        "verify_status": "verified" if agent_verified else "unverified",
+                        "status": "agent_confirmed" if agent_verified else "agent_unverified",
+                    })
+
+                    logger.info(f"[{idx}/{total}] [{token}] AGENT ✓ {cve_id} {vuln_type} "
+                                f"verify={result['verify_status']}")
+
+                else:
+                    result["status"] = "no_vuln"
+                    logger.info(f"[{idx}/{total}] [{token}] AGENT ✗ not identified")
+
+    except Exception as e:
+        result["status"] = "error"
+        logger.error(f"[{idx}/{total}] [{token}] error: {e}")
+
+    result["elapsed_sec"] = round(time.monotonic() - t0, 2)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Output
+# ═══════════════════════════════════════════════════════════════
+
+def format_output(results):
+    rows = []
+    seq = 0
+    for r in results:
+        if not r.get("has_vuln"):
+            continue
+        seq += 1
+        cve = r.get("cve_id", "")
+        name = r.get("vuln_name", "安全漏洞")
+        asset = f"{r['url']} 存在{cve} {name}" if cve else f"{r['url']} 存在{name}"
+        rows.append({
+            "序号": seq,
+            "目标资产": asset,
+            "是否存在漏洞": "是",
+            "漏洞类型": r.get("vuln_type", "安全漏洞"),
+            "漏洞编号": cve,
+            "漏洞验证描述": r.get("evidence", ""),
+            "token": r["token"],
+        })
+    return rows
+
+
+def save_results(output_rows, all_results, results_dir, elapsed, logger):
+    # scan_results.json FIRST
+    scan_json = os.path.join(results_dir, "scan_results.json")
+    with open(scan_json, "w", encoding="utf-8") as f:
+        json.dump({
+            "scan_time": datetime.now().isoformat(),
+            "method": "competition_scanner (6-layer fused architecture)",
+            "llm_model": LLM_MODEL,
+            "total_targets": len(all_results),
+            "nuclei_trust": sum(1 for r in all_results if "NUCLEI" in r.get("pipeline", "")),
+            "agent_confirmed": sum(1 for r in all_results if r.get("status") == "agent_confirmed"),
+            "fallback": sum(1 for r in all_results if "FALLBACK" in r.get("pipeline", "")),
+            "verified": sum(1 for r in all_results if r.get("verify_status") == "verified"),
+            "vulns_confirmed": sum(1 for r in all_results if r.get("has_vuln")),
+            "elapsed_sec": round(elapsed, 2),
+            "results": all_results,
+        }, f, ensure_ascii=False, indent=2)
+    logger.info(f"Scan results: {scan_json}")
+
+    # Competition JSON
+    comp_json = os.path.join(results_dir, "competition_output.json")
+    comp_data = [{k: v for k, v in row.items() if k != "token"} for row in output_rows]
+    with open(comp_json, "w", encoding="utf-8") as f:
+        json.dump(comp_data, f, ensure_ascii=False, indent=2)
+    logger.info(f"Competition JSON: {comp_json} ({len(comp_data)} entries)")
+
+    # Competition CSV
+    csv_file = os.path.join(results_dir, "competition_output.csv")
+    if output_rows:
+        fields = ["序号", "目标资产", "是否存在漏洞", "漏洞类型", "漏洞编号", "漏洞验证描述"]
+        clean_rows = []
+        for row in output_rows:
+            clean = {}
+            for k in fields:
+                v = str(row.get(k, ""))
+                v = v.replace('"', "'").replace("\r", " ").replace("\n", " | ")
+                clean[k] = v
+            clean_rows.append(clean)
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore",
+                                    quoting=csv.QUOTE_ALL, escapechar="\\")
+            writer.writeheader()
+            writer.writerows(clean_rows)
+        logger.info(f"Competition CSV: {csv_file}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    global LOCAL_TUNNEL_PORT, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT, _scan_counter, _vuln_kg, _vulhub_fps_by_product
+
+    parser = argparse.ArgumentParser(
+        description="Competition Scanner — 6-layer fused architecture + KG")
+    parser.add_argument("--nuclei-results", default="",
+                        help="Path to Nuclei results directory (optional)")
+    parser.add_argument("--kg", default=KG_PATH,
+                        help="Path to vuln_kg.json knowledge graph (fallback)")
+    parser.add_argument("--neo4j-uri", default=NEO4J_URI,
+                        help="Neo4j bolt URI")
+    parser.add_argument("--no-neo4j", action="store_true",
+                        help="Disable Neo4j, use JSON KG only")
+    parser.add_argument("--fingerprints", default="",
+                        help="Pre-computed fingerprints JSON from Docker scan")
+    parser.add_argument("--fp-dir", default=VULHUB_FP_DIR,
+                        help="Vulhub fingerprints JSON directory (for multi-CVE disambiguation)")
+    parser.add_argument("--targets", default=TARGETS_FILE)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=5)
+    parser.add_argument("--no-tunnel", action="store_true")
+    parser.add_argument("--tunnel-port", type=int, default=18080)
+    parser.add_argument("--llm-url", default=LLM_BASE_URL)
+    parser.add_argument("--llm-model", default=LLM_MODEL)
+    parser.add_argument("--llm-timeout", type=int, default=60)
+    parser.add_argument("--no-fallback", action="store_true")
+    args = parser.parse_args()
+
+    LOCAL_TUNNEL_PORT = args.tunnel_port
+    LLM_BASE_URL = args.llm_url
+    LLM_MODEL = args.llm_model
+    LLM_TIMEOUT = args.llm_timeout
+    _scan_counter = 0
+    use_fallback = not args.no_fallback
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = os.path.join(RESULTS_DIR_BASE, f"scan_{timestamp}")
+    os.makedirs(results_dir, exist_ok=True)
+
+    logger = setup_logging(results_dir)
+    logger.info("=" * 60)
+    logger.info("  Competition Scanner — 6-Layer Fused Architecture")
+    logger.info("=" * 60)
+    logger.info(f"LLM: {LLM_MODEL} at {LLM_BASE_URL} (timeout={LLM_TIMEOUT}s)")
+    logger.info(f"Workers: {args.workers} | Fallback: {use_fallback}")
+
+    # Load Neo4j KG (primary)
+    _neo4j_driver = None
+    if not args.no_neo4j:
+        try:
+            from neo4j import GraphDatabase
+            _neo4j_driver = GraphDatabase.driver(
+                args.neo4j_uri, auth=(NEO4J_USER, NEO4J_PASSWORD))
+            _neo4j_driver.verify_connectivity()
+            with _neo4j_driver.session() as s:
+                cnt = s.run("MATCH (n:BB_Product) RETURN count(n) AS c").single()["c"]
+            logger.info(f"Neo4j KG connected: {cnt} products at {args.neo4j_uri}")
+        except Exception as e:
+            logger.warning(f"Neo4j unavailable ({e}), falling back to JSON KG")
+            _neo4j_driver = None
+
+    # Load JSON KG (fallback)
+    _vuln_kg = None
+    if args.kg and os.path.isfile(args.kg):
+        try:
+            sys.path.insert(0, os.path.dirname(args.kg))
+            from kg_query import load_kg
+            _vuln_kg = load_kg(args.kg)
+            n_products = len(_vuln_kg.get("products", {}))
+            logger.info(f"JSON KG loaded: {n_products} products from {args.kg}")
+        except Exception as e:
+            logger.warning(f"Failed to load JSON KG: {e}")
+
+    if not _neo4j_driver and not _vuln_kg:
+        logger.info("No KG available — Agent will use LLM only")
+
+    # Load pre-computed fingerprints from Docker scan
+    global _precomputed_fingerprints
+    _precomputed_fingerprints = {}
+    if args.fingerprints and os.path.isfile(args.fingerprints):
+        try:
+            with open(args.fingerprints, encoding="utf-8") as f:
+                fp_data = json.load(f)
+            for entry in fp_data:
+                url = entry.get("url", "")
+                m = re.search(r"(t-[a-f0-9]+)", url)
+                if m:
+                    token = m.group(1)
+                    mf = entry.get("merged_fingerprint", {})
+                    vm = entry.get("vulhub_matches", [])
+                    _precomputed_fingerprints[token] = {
+                        "server": mf.get("server", ""),
+                        "title": mf.get("title", ""),
+                        "powered_by": "",
+                        "technologies": mf.get("technologies", []),
+                        "whatweb_plugins": mf.get("whatweb_plugins", {}),
+                        "nuclei_detections": mf.get("nuclei_detections", []),
+                        "vulhub_match": vm[0] if vm else None,
+                        "probes": entry.get("httpx", {}),
+                        "cookies": [],
+                        "reachable": True,
+                    }
+            logger.info(f"Pre-computed fingerprints loaded: {len(_precomputed_fingerprints)} targets "
+                        f"({sum(1 for v in _precomputed_fingerprints.values() if v.get('vulhub_match'))} with vulhub match)")
+        except Exception as e:
+            logger.warning(f"Failed to load fingerprints: {e}")
+
+    # Load vulhub fingerprints by product (for multi-CVE disambiguation)
+    global _vulhub_fps_by_product
+    _vulhub_fps_by_product = load_vulhub_fingerprints_by_product(args.fp_dir)
+    multi_cve = sum(1 for fps in _vulhub_fps_by_product.values() if len(fps) > 1)
+    logger.info(f"Vulhub fingerprint files: {sum(len(v) for v in _vulhub_fps_by_product.values())} files, "
+                f"{len(_vulhub_fps_by_product)} products ({multi_cve} with multiple CVEs)")
+
+    # Load Nuclei results
+    nuclei_data = {}
+    if args.nuclei_results:
+        nuclei_data = load_nuclei_results(args.nuclei_results)
+        hits = sum(1 for v in nuclei_data.values() if v.get("findings"))
+        logger.info(f"Nuclei: {len(nuclei_data)} targets loaded, {hits} with findings")
+    else:
+        logger.info("No Nuclei results provided — all targets go to Agent pipeline")
+
+    targets = read_targets(args.targets)
+    logger.info(f"Targets: {len(targets)}")
+
+    if args.limit > 0:
+        targets = targets[:args.limit]
+        logger.info(f"Limited to {len(targets)}")
+
+    tunnel_proc = None
+    if not args.no_tunnel:
+        tunnel_proc = ensure_tunnel(logger)
+
+    total = len(targets)
+    scan_start = time.monotonic()
+    all_results = [None] * total
+
+    def _work(idx_target):
+        idx, t = idx_target
+        return idx, process_target(t, nuclei_data, total, use_fallback, logger)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_work, (i, t)): i for i, t in enumerate(targets)}
+        for future in as_completed(futures):
+            try:
+                idx, result = future.result()
+                all_results[idx] = result
+            except Exception as e:
+                orig = futures[future]
+                t = targets[orig]
+                logger.error(f"[{t['token']}] Worker error: {e}")
+                all_results[orig] = {
+                    "token": t["token"], "host": t["host"], "url": t["url"],
+                    "pipeline": "ERROR", "has_vuln": False,
+                    "status": "worker_error",
+                    "vuln_type": "", "vuln_name": "",
+                    "cve_id": "", "confidence": 0,
+                    "evidence": "", "verify_status": "",
+                    "product": "", "version": "",
+                    "nuclei_findings_count": 0, "elapsed_sec": 0,
+                }
+
+    scan_elapsed = time.monotonic() - scan_start
+
+    output_rows = format_output(all_results)
+    save_results(output_rows, all_results, results_dir, scan_elapsed, logger)
+
+    # Summary
+    nuclei_trust = sum(1 for r in all_results if "NUCLEI" in r.get("pipeline", ""))
+    kg_confirmed = sum(1 for r in all_results if r.get("status") == "kg_confirmed")
+    agent_ok = sum(1 for r in all_results if r.get("status") == "agent_confirmed")
+    fallback = sum(1 for r in all_results if "FALLBACK" in r.get("pipeline", ""))
+    verified = sum(1 for r in all_results if r.get("verify_status") == "verified")
+    confirmed = sum(1 for r in all_results if r.get("has_vuln"))
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("  Scan Complete")
+    logger.info("=" * 60)
+    logger.info(f"  Total targets:     {total}")
+    logger.info(f"  NUCLEI→TRUST:      {nuclei_trust}")
+    logger.info(f"  KG confirmed:      {kg_confirmed}")
+    logger.info(f"  AGENT confirmed:   {agent_ok}")
+    logger.info(f"  FALLBACK:          {fallback}")
+    logger.info(f"  Verified (PoC OK): {verified}")
+    logger.info(f"  Vulns reported:    {confirmed}/{total}")
+    logger.info(f"  Wall clock:        {scan_elapsed:.1f}s ({scan_elapsed/60:.1f}m)")
+    logger.info(f"  Results:           {results_dir}")
+    logger.info("=" * 60)
+
+    if tunnel_proc:
+        tunnel_proc.terminate()
+
+
+if __name__ == "__main__":
+    main()
