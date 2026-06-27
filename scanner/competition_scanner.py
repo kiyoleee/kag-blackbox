@@ -558,6 +558,187 @@ def probe_active_poc(host, product_name, vuln_class, logger):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Layer 2.5: Deep Version Probe — exhaustive version extraction
+# ═══════════════════════════════════════════════════════════════
+
+VERSION_ENDPOINTS = {
+    "elasticsearch": [("/", "number")],
+    "solr": [("/solr/admin/info/system", "lucene-spec-version|solr-spec-version")],
+    "jenkins": [("/api/json", "")],
+    "grafana": [("/api/health", "version"), ("/api/frontend/settings", "buildInfo")],
+    "nacos": [("/nacos/v1/console/server/state", "version")],
+    "spring": [("/actuator/info", "version"), ("/actuator/env", "")],
+    "activemq": [("/admin/", "ActiveMQ"), ("/api/jolokia/version", "agent")],
+    "tomcat": [("/RELEASE-NOTES.txt", "Apache Tomcat Version")],
+    "nexus": [("/service/rest/v1/status", "version")],
+    "airflow": [("/api/v1/version", "version"), ("/version", "")],
+    "superset": [("/api/v1/database", ""), ("/health", "")],
+    "drupal": [("/CHANGELOG.txt", "Drupal"), ("/core/install.php", "")],
+    "wordpress": [("/wp-login.php", "ver="), ("/feed/", "generator")],
+    "joomla": [("/administrator/manifests/files/joomla.xml", "version")],
+    "gitlab": [("/api/v4/version", "version"), ("/users/sign_in", "gon.version")],
+    "confluence": [("/rest/applinks/1.0/manifest", "version")],
+    "zabbix": [("/index.php", "Zabbix")],
+    "kibana": [("/api/status", "version")],
+    "weblogic": [("/console/", "WebLogic Server Version")],
+    "geoserver": [("/geoserver/web/", "GeoServer")],
+    "couchdb": [("/", "version")],
+    "phpmyadmin": [("/", "PMA_VERSION"), ("/doc/html/index.html", "phpMyAdmin")],
+    "django": [("/admin/", "django")],
+    "flask": [("/", "Werkzeug")],
+    "vite": [("/@vite/client", "")],
+    "flink": [("/config", "flink-version")],
+    "mongo-express": [("/", "mongo-express")],
+    "hugegraph": [("/apis/version", "version"), ("/versions", "")],
+    "harbor": [("/api/v2.0/systeminfo", "harbor_version")],
+    "struts2": [("/struts/", "")],
+    "shiro": [("/login", "")],
+    "fastjson": [("/", "")],
+}
+
+GENERIC_VERSION_PATHS = [
+    "/api/version", "/version", "/api/v1/version",
+    "/api/info", "/info", "/status",
+    "/RELEASE-NOTES.txt", "/CHANGES.txt", "/CHANGELOG.md", "/package.json",
+]
+
+_VP = [
+    re.compile(r'"version"\s*:\s*"([^"]+)"'),
+    re.compile(r'"number"\s*:\s*"([^"]+)"'),
+    re.compile(r'[Vv]ersion[:\s]+(\d+\.\d+[\.\d\w-]*)'),
+    re.compile(r'[>/ ](\d+\.\d+\.\d+[-.\w]*)'),
+]
+
+
+def _extract_version_from_text(text):
+    """Try multiple patterns to extract a version string."""
+    for pat in _VP:
+        m = pat.search(text)
+        if m:
+            v = m.group(1).strip().rstrip(".")
+            if len(v) >= 3 and not v.startswith("0.0.0") and v != "1.0":
+                return v
+    return None
+
+
+def deep_version_probe(host, product_name, fingerprint, logger):
+    """Exhaustively probe for version info. Returns on first match, max 8 probes."""
+    prod = product_name.lower().strip()
+    probes_done = 0
+    max_probes = 8
+
+    # ── 0. Already available data ──
+    server = fingerprint.get("server", "")
+    if server:
+        v = _extract_version_from_text(server)
+        if v:
+            return {"version": v, "source": "server_header", "raw": server}
+
+    powered_by = fingerprint.get("powered_by", "")
+    if powered_by:
+        v = _extract_version_from_text(powered_by)
+        if v:
+            return {"version": v, "source": "x-powered-by", "raw": powered_by}
+
+    # Check TCP services
+    for svc in (fingerprint.get("tcp_services") or []):
+        if svc.get("version"):
+            return {"version": svc["version"], "source": f"tcp_{svc['service']}:{svc.get('port','')}", "raw": svc.get("banner", "")}
+
+    # Check credential probe
+    creds = fingerprint.get("default_creds") or {}
+    if creds.get("version"):
+        return {"version": creds["version"], "source": "default_creds", "raw": creds.get("response_snippet", "")}
+
+    # ── 1. Product-specific endpoints ──
+    endpoints = VERSION_ENDPOINTS.get(prod, [])
+    # Also try aliases
+    for alias, eps in VERSION_ENDPOINTS.items():
+        if alias in prod or prod in alias:
+            if eps and eps != endpoints:
+                endpoints = endpoints + [e for e in eps if e not in endpoints]
+                break
+
+    for path, hint in endpoints:
+        if probes_done >= max_probes:
+            break
+        probes_done += 1
+        resp = http_request(host, path, timeout=5)
+        if resp["status"] <= 0:
+            continue
+
+        full_text = resp.get("headers", "") + "\n" + resp.get("body", "")
+
+        # Check X-Jenkins or other version headers
+        for hdr_line in resp.get("headers", "").split("\n"):
+            hl = hdr_line.lower().strip()
+            if hl.startswith("x-jenkins:") or hl.startswith("x-version:"):
+                v = _extract_version_from_text(hdr_line)
+                if v:
+                    return {"version": v, "source": f"header:{path}", "raw": hdr_line.strip()}
+
+        v = _extract_version_from_text(full_text)
+        if v:
+            return {"version": v, "source": f"endpoint:{path}", "raw": full_text[:200]}
+
+    # ── 2. Generic version paths ──
+    for path in GENERIC_VERSION_PATHS:
+        if probes_done >= max_probes:
+            break
+        probes_done += 1
+        resp = http_request(host, path, timeout=5)
+        if resp["status"] <= 0 or resp["status"] == 404:
+            continue
+        full_text = resp.get("headers", "") + "\n" + resp.get("body", "")
+        v = _extract_version_from_text(full_text)
+        if v:
+            return {"version": v, "source": f"generic:{path}", "raw": full_text[:200]}
+
+    # ── 3. Error page version extraction ──
+    if probes_done < max_probes:
+        probes_done += 1
+        resp = http_request(host, "/thispagedoesnotexist_12345", timeout=5)
+        if resp["status"] > 0:
+            full_text = resp.get("headers", "") + "\n" + resp.get("body", "")
+            v = _extract_version_from_text(full_text)
+            if v:
+                return {"version": v, "source": "error_page", "raw": full_text[:200]}
+
+    return {"version": None, "source": "", "raw": ""}
+
+
+def filter_cves_by_version(product_cves, version):
+    """Filter candidate CVEs by version match. Returns (matched, unmatched)."""
+    if not version:
+        return product_cves, []
+    matched = []
+    unmatched = []
+    for cfp in product_cves:
+        affected = (cfp.get("affected_versions") or "").lower()
+        if not affected:
+            matched.append(cfp)
+            continue
+        ver = version.lower()
+        if ver in affected:
+            matched.append(cfp)
+        else:
+            m = re.search(r'<\s*([\d.]+)', affected)
+            if m:
+                try:
+                    target_parts = [int(x) for x in ver.split(".")[:3] if x.isdigit()]
+                    limit_parts = [int(x) for x in m.group(1).split(".")[:3] if x.isdigit()]
+                    if target_parts and limit_parts and target_parts < limit_parts:
+                        matched.append(cfp)
+                    else:
+                        unmatched.append(cfp)
+                except (ValueError, TypeError):
+                    matched.append(cfp)
+            else:
+                matched.append(cfp)
+    return matched if matched else product_cves, unmatched
+
+
+# ═══════════════════════════════════════════════════════════════
 # Layer 3: Nuclei — load pre-scanned results
 # ═══════════════════════════════════════════════════════════════
 
@@ -768,15 +949,104 @@ def load_vulhub_fingerprints_by_product(fp_dir):
     return by_product
 
 
-def probe_cve_detection(host, cve_fp):
-    """Probe a specific CVE's detection path and check match_indicators."""
+def _check_version_match(cve_fp, detected_version):
+    """Check if a detected version falls within the CVE's affected range."""
+    if not detected_version:
+        return False
+    affected = (cve_fp.get("affected_versions") or "").lower()
+    if not affected:
+        return False
+    ver = detected_version.lower().strip()
+    if ver in affected:
+        return True
+    # Check "< X.Y.Z" pattern
+    m = re.search(r'<\s*([\d.]+)', affected)
+    if m:
+        try:
+            from packaging.version import Version
+            return Version(ver) < Version(m.group(1))
+        except Exception:
+            pass
+    return False
+
+
+def probe_cve_detection(host, cve_fp, tcp_services=None):
+    """Deep probe: HTTP detection path + TCP protocol + version matching + match_indicators."""
     detection = cve_fp.get("detection") or {}
     det_path = detection.get("path", "")
     det_method = detection.get("method", "GET")
     det_headers = detection.get("request_headers") or {}
     match_indicators = detection.get("match_indicators") or []
+    ports = cve_fp.get("ports") or []
 
-    if not det_path or det_method == "RAW-TCP" or det_path.startswith("tcp://"):
+    # ── TCP/RAW-TCP probing ──
+    if det_method == "RAW-TCP" or det_path.startswith("tcp://"):
+        tcp_matched = []
+        tcp_response = ""
+        tcp_score = 0
+
+        # Extract target port from path like "tcp://target:61616"
+        port_m = re.search(r':(\d+)', det_path)
+        tcp_port = int(port_m.group(1)) if port_m else (ports[0] if ports else 0)
+
+        if tcp_port > 0:
+            # Use existing TCP probe infrastructure
+            probe_fn = SERVICE_PROBES.get(tcp_port, _probe_generic)
+            try:
+                result = probe_fn(host, tcp_port)
+                if result:
+                    tcp_response = result.get("banner", "")
+                    tcp_score += 2
+                    # Check match_indicators against TCP banner
+                    for indicator in match_indicators:
+                        if isinstance(indicator, str) and indicator.lower() in tcp_response.lower():
+                            tcp_matched.append(indicator)
+                            tcp_score += 3
+                    # Version match bonus
+                    if result.get("version") and _check_version_match(cve_fp, result["version"]):
+                        tcp_score += 4
+                        tcp_matched.append(f"version {result['version']} in affected range")
+            except Exception:
+                pass
+
+        # Also check non-primary ports for service presence
+        for port in ports:
+            if port == tcp_port or port in (80, 443, 8080, 8443):
+                continue
+            banner = tcp_probe(host, port)
+            if banner:
+                banner_text = banner.decode("utf-8", errors="replace")
+                tcp_score += 1
+                for indicator in match_indicators:
+                    if isinstance(indicator, str) and indicator.lower() in banner_text.lower():
+                        if indicator not in tcp_matched:
+                            tcp_matched.append(indicator)
+                            tcp_score += 3
+
+        return {
+            "probed": tcp_port > 0,
+            "score": tcp_score,
+            "matched_indicators": tcp_matched,
+            "total_indicators": len(match_indicators),
+            "response": tcp_response[:1500],
+            "status": 1 if tcp_score > 0 else 0,
+            "curl": f"tcp_probe {host}:{tcp_port}",
+        }
+
+    # ── HTTP probing ──
+    if not det_path:
+        # No detection path — try version matching from tcp_services
+        if tcp_services:
+            for svc in tcp_services:
+                if svc.get("version") and _check_version_match(cve_fp, svc["version"]):
+                    return {
+                        "probed": True, "score": 4,
+                        "matched_indicators": [f"version {svc['version']} in affected range"],
+                        "total_indicators": len(match_indicators),
+                        "response": f"{svc['service']}:{svc.get('port','')} banner={svc.get('banner','')}",
+                        "status": 1,
+                        "curl": f"tcp_probe {host}:{svc.get('port','')}",
+                    }
         return {"probed": False, "score": 0, "matched_indicators": []}
 
     headers = {"Host": host}
@@ -794,6 +1064,16 @@ def probe_cve_detection(host, cve_fp):
             matched.append(indicator)
 
     score = len(matched) * 3 + (1 if probe["status"] > 0 else 0)
+
+    # Version extraction from detection response
+    body = probe.get("body", "")
+    for pat in [r'(\d+\.\d+\.\d+[-.\w]*)', r'[Vv]ersion[:\s]+(\S+)']:
+        m = re.search(pat, body)
+        if m and _check_version_match(cve_fp, m.group(1)):
+            score += 4
+            matched.append(f"version {m.group(1)} in affected range")
+            break
+
     return {
         "probed": True,
         "score": score,
@@ -1097,14 +1377,30 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     fp["version"] = cred_result["version"]
                     result["version"] = cred_result["version"]
 
+                # Deep version probing — exhaustive version extraction
+                version_info = deep_version_probe(host, product_name, fp, logger)
+                if version_info.get("version"):
+                    fp["detected_version"] = version_info["version"]
+                    result["version"] = version_info["version"]
+                    logger.info(f"[{token}] VERSION: {version_info['version']} "
+                                f"(from {version_info.get('source','')})")
+
                 if len(product_cves) <= 1:
                     # ── Single CVE: probe + verify match_indicators ──
                     chosen_fp = product_cves[0] if product_cves else vm
                     cve_list = chosen_fp.get("cve") or vm["cve"]
                     cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
-                    pr = probe_cve_detection(host, chosen_fp)
+                    pr = probe_cve_detection(host, chosen_fp, tcp_services=fp.get("tcp_services"))
                     verified = bool(pr.get("matched_indicators"))
                     fp_score = vm.get("score", 0)
+                    # Version match boosts confidence
+                    detected_ver = fp.get("detected_version")
+                    if detected_ver and _check_version_match(chosen_fp, detected_ver):
+                        fp_score += 5
+                        if not verified:
+                            verified = True
+                            pr.setdefault("matched_indicators", []).append(
+                                f"version {detected_ver} in affected range")
                     vuln_class = chosen_fp.get("vuln_class") or vm.get("vuln_class", "")
 
                     # Active PoC probe if not yet verified
@@ -1154,13 +1450,22 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
 
                 else:
                     # ── Multiple CVEs: probe each + LLM disambiguation ──
+                    # Version-based pre-filtering
+                    detected_ver = fp.get("detected_version") or result.get("version")
+                    if detected_ver and len(product_cves) > 1:
+                        filtered, excluded = filter_cves_by_version(product_cves, detected_ver)
+                        if len(filtered) < len(product_cves):
+                            logger.info(f"[{token}] VERSION-FILTER: {detected_ver} → "
+                                        f"{len(filtered)}/{len(product_cves)} CVEs remain")
+                            product_cves = filtered
+
                     probe_results = {}
                     best_probe_score = 0
                     best_probe_fp = None
                     for cfp in product_cves:
                         cves = cfp.get("cve", [])
                         cve_id = cves[0] if isinstance(cves, list) and cves else str(cves)
-                        pr = probe_cve_detection(host, cfp)
+                        pr = probe_cve_detection(host, cfp, tcp_services=fp.get("tcp_services"))
                         probe_results[cve_id] = pr
                         if pr.get("score", 0) > best_probe_score:
                             best_probe_score = pr["score"]
@@ -1211,7 +1516,7 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                         if active_poc.get("detected"):
                             verified = True
 
-                    has_vuln = verified or best_probe_score >= 4 or fp_score >= 8
+                    has_vuln = verified or best_probe_score >= 6 or fp_score >= 8
                     verify = {
                         "verified": verified,
                         "evidence_request": pr.get("curl", ""),
@@ -1323,7 +1628,8 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     agent_result = kag_thinker_reason(
                         target, fp, kg_candidates, _neo4j_driver, logger)
 
-                    if agent_result and agent_result.get("has_vuln"):
+                    agent_conf = float(agent_result.get("confidence", 0)) if agent_result else 0
+                    if agent_result and agent_result.get("has_vuln") and agent_conf >= 0.7:
                         result.update({
                             "has_vuln": True,
                             "product": agent_result.get("product", ""),
@@ -1331,7 +1637,7 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                             "cve_id": agent_result.get("cve_id", ""),
                             "vuln_type": agent_result.get("vuln_type", "安全漏洞"),
                             "vuln_name": agent_result.get("vuln_name", ""),
-                            "confidence": agent_result.get("confidence", 0.7),
+                            "confidence": agent_conf,
                             "evidence": agent_result.get("evidence", ""),
                             "verify_status": agent_result.get("verify_status", "unverified"),
                             "status": "agent_pipeline_confirmed",
