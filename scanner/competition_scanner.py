@@ -31,6 +31,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -67,6 +68,12 @@ _scan_counter = 0
 _vuln_kg = None  # JSON KG (fallback)
 _neo4j_driver = None  # Neo4j driver (primary)
 _vulhub_fps_by_product = {}  # product_name_lower → [fp_dict, ...]
+_nuclei_bin = ""  # path to nuclei binary
+_surper_templates = ""  # path to surper-666/nuclei templates
+_use_nmap = True
+_use_live_nuclei = False
+_no_httpx = False
+_no_sqlmap = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -798,6 +805,291 @@ def load_nuclei_results(nuclei_dir):
     return out
 
 
+def _find_nuclei_bin():
+    """Locate the nuclei binary."""
+    if _nuclei_bin and os.path.isfile(_nuclei_bin):
+        return _nuclei_bin
+    for candidate in [
+        "nuclei",
+        "/usr/local/bin/nuclei",
+        "/data/lqy/framework/nuclei-scanner/nuclei",
+        os.path.expanduser("~/go/bin/nuclei"),
+        "/usr/bin/nuclei",
+    ]:
+        try:
+            r = subprocess.run([candidate, "-version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return candidate
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    return ""
+
+
+def nmap_scan(host, logger, timeout=120):
+    """Run nmap service/version detection. Returns open ports with service info."""
+    try:
+        subprocess.run(["nmap", "--version"], capture_output=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        logger.debug(f"nmap not installed, skipping port scan for {host}")
+        return {"ports": [], "os": ""}
+
+    # Extract IP and port if host is ip:port format
+    target_host = host.split(":")[0] if ":" in host else host
+    target_port_arg = []
+    if ":" in host:
+        port = host.split(":")[1]
+        target_port_arg = ["-p", port]
+
+    # Try with service version detection first
+    cmd = ["nmap", "-sV", "-sT", "--top-ports", "1000", "-T4", "--open",
+           "-oX", "-", "--host-timeout", str(timeout)] + target_port_arg + [target_host]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+        xml_output = proc.stdout
+    except subprocess.TimeoutExpired:
+        # Fallback: faster scan without version detection
+        logger.debug(f"nmap -sV timed out for {host}, trying fast scan")
+        cmd = ["nmap", "-sT", "--top-ports", "100", "-T4", "--open",
+               "-oX", "-", "--host-timeout", "60"] + target_port_arg + [target_host]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=70)
+            xml_output = proc.stdout
+        except (subprocess.TimeoutExpired, Exception):
+            return {"ports": [], "os": ""}
+    except Exception:
+        return {"ports": [], "os": ""}
+
+    # Parse XML output
+    ports = []
+    os_info = ""
+    try:
+        root = ET.fromstring(xml_output)
+        for host_elem in root.findall(".//host"):
+            for port_elem in host_elem.findall(".//port"):
+                state = port_elem.find("state")
+                if state is None or state.get("state") != "open":
+                    continue
+                port_num = int(port_elem.get("portid", 0))
+                protocol = port_elem.get("protocol", "tcp")
+                service_elem = port_elem.find("service")
+                service_name = ""
+                service_version = ""
+                service_product = ""
+                if service_elem is not None:
+                    service_name = service_elem.get("name", "")
+                    service_version = service_elem.get("version", "")
+                    service_product = service_elem.get("product", "")
+                ports.append({
+                    "port": port_num,
+                    "protocol": protocol,
+                    "service": service_name,
+                    "version": service_version,
+                    "product": service_product,
+                })
+            os_elem = host_elem.find(".//osmatch")
+            if os_elem is not None:
+                os_info = os_elem.get("name", "")
+    except ET.ParseError:
+        logger.debug(f"nmap XML parse error for {host}")
+
+    if ports:
+        logger.debug(f"nmap {host}: {len(ports)} open ports — "
+                     + ", ".join(f"{p['port']}/{p['service']}" for p in ports[:5]))
+    return {"ports": ports, "os": os_info}
+
+
+def nuclei_live_scan(host, logger, timeout=180):
+    """Run nuclei live scan against a target. Returns findings list."""
+    nuclei = _find_nuclei_bin()
+    if not nuclei:
+        logger.debug("nuclei binary not found, skipping live scan")
+        return []
+
+    target_url = f"http://{host}" if not host.startswith("http") else host
+    findings = []
+
+    template_dirs = []
+    if _surper_templates and os.path.isdir(_surper_templates):
+        template_dirs.append(_surper_templates)
+
+    # If no specific templates, use nuclei's default (if installed via go install)
+    if not template_dirs:
+        default_dir = os.path.expanduser("~/nuclei-templates/http")
+        if os.path.isdir(default_dir):
+            template_dirs.append(default_dir)
+
+    cmd = [nuclei, "-u", target_url, "-json", "-silent",
+           "-timeout", "10", "-retries", "1", "-rate-limit", "50",
+           "-severity", "critical,high,medium"]
+    for td in template_dirs:
+        cmd.extend(["-t", td])
+
+    if not template_dirs:
+        # No template dirs specified — let nuclei use its defaults
+        pass
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        for line in proc.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                finding = json.loads(line)
+                classification = (finding.get("info") or {}).get("classification") or {}
+                cve_list = classification.get("cve-id") or []
+                cve_id = ""
+                if cve_list:
+                    cve_id = cve_list[0] if isinstance(cve_list, list) else str(cve_list)
+                if not cve_id:
+                    tid = (finding.get("template-id") or "").upper()
+                    cm = re.search(r"(CVE-\d{4}-\d+)", tid)
+                    if cm:
+                        cve_id = cm.group(1)
+                findings.append({
+                    "template_id": finding.get("template-id", ""),
+                    "name": (finding.get("info") or {}).get("name", ""),
+                    "severity": (finding.get("info") or {}).get("severity", ""),
+                    "cve_id": cve_id,
+                    "description": (finding.get("info") or {}).get("description", ""),
+                    "tags": (finding.get("info") or {}).get("tags", []),
+                    "curl_command": finding.get("curl-command", ""),
+                    "matched_at": finding.get("matched-at", ""),
+                })
+            except json.JSONDecodeError:
+                pass
+    except subprocess.TimeoutExpired:
+        logger.debug(f"nuclei live scan timed out for {host} after {timeout}s")
+    except Exception as e:
+        logger.debug(f"nuclei live scan error for {host}: {e}")
+
+    if findings:
+        logger.info(f"[{host}] NUCLEI-LIVE: {len(findings)} findings — "
+                    + ", ".join(f.get("cve_id", f.get("template_id", "")) for f in findings[:3]))
+    return findings
+
+
+def _find_bin(names):
+    """Find a binary from a list of candidate paths."""
+    for name in names:
+        try:
+            proc = subprocess.run(["which", name], capture_output=True, text=True, timeout=5)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except Exception:
+            pass
+    return None
+
+
+def sqlmap_scan(host, path, logger, timeout=60):
+    """Run sqlmap to verify SQL injection. Returns dict with results."""
+    sqlmap_bin = _find_bin(["sqlmap", "/usr/local/bin/sqlmap", "/usr/bin/sqlmap"])
+    if not sqlmap_bin:
+        try:
+            proc = subprocess.run(["python3", "-m", "sqlmap", "--version"],
+                                  capture_output=True, text=True, timeout=5)
+            if proc.returncode == 0:
+                sqlmap_bin = "python3 -m sqlmap"
+        except Exception:
+            pass
+    if not sqlmap_bin:
+        return {"vulnerable": False, "reason": "sqlmap not found"}
+
+    url = f"http://{host}{path}" if path else f"http://{host}/"
+    cmd = (f"{sqlmap_bin} -u \"{url}\" --batch --level=1 --risk=1 "
+           f"--timeout=10 --retries=1 --threads=3 --forms --crawl=1 "
+           f"--output-dir=/tmp/sqlmap_{host.replace('.','_')}")
+
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        output = proc.stdout + proc.stderr
+
+        vulnerable = False
+        parameter = ""
+        dbms = ""
+
+        if "is vulnerable" in output.lower() or "sqlmap identified" in output.lower():
+            vulnerable = True
+            m = re.search(r"Parameter:\s+['\"]?(\w+)", output)
+            if m:
+                parameter = m.group(1)
+            m = re.search(r"back-end DBMS:\s+(.+?)(?:\n|$)", output)
+            if m:
+                dbms = m.group(1).strip()
+
+        if vulnerable:
+            logger.info(f"[{host}] SQLMAP: vulnerable! param={parameter} dbms={dbms}")
+        else:
+            logger.debug(f"[{host}] SQLMAP: not vulnerable")
+
+        return {
+            "vulnerable": vulnerable,
+            "parameter": parameter,
+            "dbms": dbms,
+            "evidence": output[-500:] if vulnerable else "",
+        }
+    except subprocess.TimeoutExpired:
+        logger.debug(f"[{host}] SQLMAP: timed out after {timeout}s")
+        return {"vulnerable": False, "reason": "timeout"}
+    except Exception as e:
+        logger.debug(f"[{host}] SQLMAP: error {e}")
+        return {"vulnerable": False, "reason": str(e)}
+
+
+def httpx_fingerprint(host, logger, timeout=30):
+    """Run httpx or whatweb for technology fingerprinting."""
+    result = {"technologies": [], "server": "", "title": "", "whatweb_plugins": {}}
+
+    # Try httpx first
+    httpx_bin = _find_bin(["httpx", "/usr/local/bin/httpx", "/data/lqy/go/bin/httpx"])
+    if httpx_bin:
+        try:
+            cmd = [httpx_bin, "-u", f"http://{host}", "-json", "-silent",
+                   "-tech-detect", "-status-code", "-title", "-server",
+                   "-follow-redirects", "-timeout", "10"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if proc.stdout.strip():
+                data = json.loads(proc.stdout.strip().split("\n")[0])
+                result["technologies"] = data.get("tech") or data.get("technologies") or []
+                result["server"] = data.get("webserver") or data.get("server") or ""
+                result["title"] = data.get("title") or ""
+                if result["technologies"]:
+                    logger.debug(f"[{host}] HTTPX: {', '.join(result['technologies'][:5])}")
+                return result
+        except Exception as e:
+            logger.debug(f"[{host}] HTTPX error: {e}")
+
+    # Fallback to whatweb
+    whatweb_bin = _find_bin(["whatweb", "/usr/local/bin/whatweb"])
+    if whatweb_bin:
+        try:
+            cmd = [whatweb_bin, "-q", "--color=never", "--log-json=-", f"http://{host}"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if proc.stdout.strip():
+                for line in proc.stdout.strip().split("\n"):
+                    try:
+                        data = json.loads(line)
+                        plugins = data.get("plugins") or {}
+                        result["whatweb_plugins"] = {k: v for k, v in plugins.items()
+                                                     if k not in ("IP", "Country", "UncommonHeaders")}
+                        result["technologies"] = list(result["whatweb_plugins"].keys())
+                        http_server = plugins.get("HTTPServer", {})
+                        if isinstance(http_server, dict) and http_server.get("string"):
+                            result["server"] = str(http_server["string"][0]) if isinstance(http_server["string"], list) else str(http_server["string"])
+                        title = plugins.get("Title", {})
+                        if isinstance(title, dict) and title.get("string"):
+                            result["title"] = str(title["string"][0]) if isinstance(title["string"], list) else str(title["string"])
+                        break
+                    except json.JSONDecodeError:
+                        pass
+                if result["technologies"]:
+                    logger.debug(f"[{host}] WHATWEB: {', '.join(result['technologies'][:5])}")
+        except Exception as e:
+            logger.debug(f"[{host}] WHATWEB error: {e}")
+
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════
 # Layer 4: Agent — LLM product identification + PoC generation
 # ═══════════════════════════════════════════════════════════════
@@ -1410,6 +1702,15 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                         if active_poc.get("detected"):
                             verified = True
 
+                    # sqlmap for SQL injection verification
+                    if not verified and not _no_sqlmap and vuln_class in ("sqli", "sql injection"):
+                        sq = sqlmap_scan(host, "/", logger)
+                        if sq.get("vulnerable"):
+                            verified = True
+                            active_poc = {"detected": True, "vuln_class": "sqli",
+                                          "evidence": sq.get("evidence", ""),
+                                          "probe_path": f"sqlmap: param={sq.get('parameter','')} dbms={sq.get('dbms','')}"}
+
                     has_vuln = verified or fp_score >= 8
                     verify = {
                         "verified": verified,
@@ -1516,6 +1817,15 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                         if active_poc.get("detected"):
                             verified = True
 
+                    # sqlmap for SQL injection verification
+                    if not verified and not _no_sqlmap and vuln_class in ("sqli", "sql injection"):
+                        sq = sqlmap_scan(host, "/", logger)
+                        if sq.get("vulnerable"):
+                            verified = True
+                            active_poc = {"detected": True, "vuln_class": "sqli",
+                                          "evidence": sq.get("evidence", ""),
+                                          "probe_path": f"sqlmap: param={sq.get('parameter','')} dbms={sq.get('dbms','')}"}
+
                     has_vuln = verified or best_probe_score >= 6 or fp_score >= 8
                     verify = {
                         "verified": verified,
@@ -1554,6 +1864,46 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     return result
         else:
             fp = surface_fingerprint(host, logger, token)
+
+            # nmap port scan for non-Traefik targets (direct IP:port access)
+            if _use_nmap and not host.endswith(".rce.lab"):
+                nmap_result = nmap_scan(host, logger)
+                if nmap_result.get("ports"):
+                    fp["nmap_services"] = nmap_result["ports"]
+                    nmap_ports = [p["port"] for p in nmap_result["ports"]]
+                    tcp_results = multi_protocol_fingerprint(host, nmap_ports, logger)
+                    if tcp_results:
+                        fp["tcp_services"] = tcp_results
+                    # Use nmap product/version for KG enrichment
+                    for svc in nmap_result["ports"]:
+                        if svc.get("product") and not fp.get("server"):
+                            fp["server"] = f"{svc['product']}/{svc['version']}" if svc.get("version") else svc["product"]
+                        if svc.get("version") and not fp.get("detected_version"):
+                            fp["detected_version"] = svc["version"]
+
+            # httpx/whatweb fingerprinting for non-precomputed targets
+            if not _no_httpx:
+                try:
+                    hx = httpx_fingerprint(host, logger)
+                    if hx.get("technologies"):
+                        fp["technologies"] = hx["technologies"]
+                    if hx.get("server") and not fp.get("server"):
+                        fp["server"] = hx["server"]
+                    if hx.get("title") and not fp.get("title"):
+                        fp["title"] = hx["title"]
+                    if hx.get("whatweb_plugins"):
+                        fp["whatweb_plugins"] = hx["whatweb_plugins"]
+                except Exception:
+                    pass
+
+            # Live nuclei scan if no pre-scanned results
+            if _use_live_nuclei and token not in nuclei_data:
+                live_findings = nuclei_live_scan(host, logger)
+                if live_findings:
+                    nuclei_data[token] = {"token": token, "findings": live_findings}
+                    has_nuclei = True
+                    pipeline = "NUCLEI-LIVE→VERIFY"
+                    result["pipeline"] = pipeline
 
         fp = fp if isinstance(fp, dict) else surface_fingerprint(host, logger, token)
 
@@ -1887,6 +2237,18 @@ def main():
     parser.add_argument("--llm-model", default=LLM_MODEL)
     parser.add_argument("--llm-timeout", type=int, default=60)
     parser.add_argument("--no-fallback", action="store_true")
+    parser.add_argument("--no-nmap", action="store_true",
+                        help="Skip nmap port scanning")
+    parser.add_argument("--nuclei-bin", default="",
+                        help="Path to nuclei binary")
+    parser.add_argument("--surper-templates", default="",
+                        help="Path to surper-666/nuclei templates for live scan")
+    parser.add_argument("--live-nuclei", action="store_true",
+                        help="Run nuclei live scan for targets without pre-scanned results")
+    parser.add_argument("--no-sqlmap", action="store_true",
+                        help="Skip sqlmap SQL injection verification")
+    parser.add_argument("--no-httpx", action="store_true",
+                        help="Skip httpx/whatweb fingerprinting")
     args = parser.parse_args()
 
     LOCAL_TUNNEL_PORT = args.tunnel_port
@@ -1895,6 +2257,12 @@ def main():
     LLM_TIMEOUT = args.llm_timeout
     _scan_counter = 0
     use_fallback = not args.no_fallback
+    _use_nmap = not args.no_nmap
+    _use_live_nuclei = args.live_nuclei
+    _no_httpx = args.no_httpx
+    _no_sqlmap = args.no_sqlmap
+    _nuclei_bin = args.nuclei_bin
+    _surper_templates = args.surper_templates
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = os.path.join(RESULTS_DIR_BASE, f"scan_{timestamp}")
