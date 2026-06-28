@@ -1091,6 +1091,205 @@ def httpx_fingerprint(host, logger, timeout=30):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Fingerprint Fusion — unify signals from all probing tools
+# ═══════════════════════════════════════════════════════════════
+
+PRODUCT_ALIASES = {
+    "httpd": "apache", "apache2": "apache", "apache httpd": "apache",
+    "apache http server": "apache",
+    "nginx": "nginx", "openresty": "nginx",
+    "tomcat": "tomcat", "apache tomcat": "tomcat",
+    "activemq": "activemq", "apache activemq": "activemq",
+    "mysql": "mysql", "mariadb": "mysql",
+    "phpmyadmin": "phpmyadmin", "pma": "phpmyadmin",
+    "jenkins": "jenkins", "grafana": "grafana",
+    "elasticsearch": "elasticsearch", "elastic": "elasticsearch",
+    "kibana": "kibana",
+    "weblogic": "weblogic", "oracle weblogic": "weblogic",
+    "weblogic server": "weblogic",
+    "jboss": "jboss", "wildfly": "jboss",
+    "jboss application server": "jboss",
+    "wordpress": "wordpress", "drupal": "drupal", "joomla": "joomla",
+    "redis": "redis", "memcached": "memcached",
+    "postgresql": "postgres", "postgres": "postgres",
+    "mongodb": "mongodb", "mongo": "mongodb", "mongo-express": "mongo-express",
+    "openssh": "openssh", "vsftpd": "vsftpd", "proftpd": "proftpd",
+    "docker": "docker", "consul": "consul",
+    "apache solr": "solr", "solr": "solr",
+    "apache struts": "struts2", "struts2": "struts2", "struts": "struts2",
+    "apache shiro": "shiro", "shiro": "shiro",
+    "spring boot": "spring", "spring framework": "spring", "spring": "spring",
+    "django": "django", "flask": "flask", "laravel": "laravel",
+    "rabbitmq": "rabbitmq", "zookeeper": "zookeeper", "kafka": "kafka",
+    "nacos": "nacos", "dubbo": "dubbo", "flink": "flink",
+    "airflow": "airflow", "superset": "superset",
+    "confluence": "confluence", "jira": "jira", "gitlab": "gitlab",
+    "nexus": "nexus", "sonatype nexus": "nexus",
+    "couchdb": "couchdb", "zabbix": "zabbix",
+    "gunicorn": "python", "werkzeug": "flask", "uvicorn": "python",
+    "jetty": "jetty", "glassfish": "glassfish",
+    "microsoft-iis": "iis", "iis": "iis",
+}
+
+COOKIE_PRODUCT_MAP = {
+    "jsessionid": "java", "phpsessid": "php", "asp.net_sessionid": "asp.net",
+    "laravel_session": "laravel", "csrftoken": "django", "_xsrf": "tornado",
+    "rack.session": "ruby", "connect.sid": "node",
+}
+
+PORT_PRODUCT_MAP = {
+    6379: "redis", 3306: "mysql", 5432: "postgres", 27017: "mongodb",
+    11211: "memcached", 61616: "activemq", 8161: "activemq",
+    9092: "kafka", 2181: "zookeeper", 5672: "rabbitmq",
+    9200: "elasticsearch", 5601: "kibana",
+    21: "ftp", 22: "ssh", 25: "smtp", 389: "ldap",
+    2375: "docker", 8500: "consul", 4848: "glassfish",
+    1099: "java-rmi", 7001: "weblogic", 8009: "tomcat",
+    20880: "dubbo", 9100: "node-exporter",
+    8848: "nacos", 8088: "hadoop", 50070: "hadoop",
+}
+
+
+def _normalize_product(name):
+    """Normalize a product name via aliases."""
+    if not name:
+        return ""
+    key = name.lower().strip().rstrip("/")
+    return PRODUCT_ALIASES.get(key, key)
+
+
+def fuse_fingerprint(fp, logger):
+    """Fuse signals from all probing tools into unified product candidates."""
+    candidates = {}  # product_name → {"confidence": float, "version": str, "signals": [], "ports": set}
+
+    def _add(product, confidence, signal, version="", port=None):
+        p = _normalize_product(product)
+        if not p or len(p) < 2:
+            return
+        if p not in candidates:
+            candidates[p] = {"confidence": 0, "version": "", "signals": [], "ports": set()}
+        c = candidates[p]
+        c["confidence"] += confidence
+        c["signals"].append(signal)
+        if version and (not c["version"] or len(version) > len(c["version"])):
+            c["version"] = version
+        if port:
+            c["ports"].add(port)
+
+    # 1. Server header
+    server = fp.get("server", "")
+    if server:
+        m = re.match(r'([\w.-]+?)(?:/(\S+))?$', server.split(",")[0].strip())
+        if m:
+            _add(m.group(1), 0.2, f"server:{server}", m.group(2) or "")
+
+    # 2. Page title
+    title = fp.get("title", "")
+    if title:
+        title_lower = title.lower()
+        for alias, prod in PRODUCT_ALIASES.items():
+            if alias in title_lower:
+                _add(prod, 0.3, f"title:{title[:50]}")
+                break
+
+    # 3. httpx technologies
+    for tech in (fp.get("technologies") or []):
+        _add(tech, 0.2, f"httpx:{tech}")
+
+    # 4. whatweb plugins
+    for plugin_name in (fp.get("whatweb_plugins") or {}):
+        _add(plugin_name, 0.2, f"whatweb:{plugin_name}")
+
+    # 5. nmap services
+    for svc in (fp.get("nmap_services") or []):
+        prod = svc.get("product") or svc.get("service", "")
+        ver = svc.get("version", "")
+        port = svc.get("port")
+        _add(prod, 0.25, f"nmap:{prod}/{ver}@{port}", ver, port)
+
+    # 6. TCP services
+    for svc in (fp.get("tcp_services") or []):
+        _add(svc.get("service", ""), 0.2, f"tcp:{svc.get('service','')}@{svc.get('port','')}",
+             svc.get("version", ""), svc.get("port"))
+
+    # 7. Default credentials (high confidence if authenticated)
+    creds = fp.get("default_creds")
+    if isinstance(creds, dict) and creds.get("authenticated"):
+        # The product is whatever we tested credentials for — already in fp context
+        if creds.get("version"):
+            for p in list(candidates):
+                if not candidates[p]["version"]:
+                    candidates[p]["version"] = creds["version"]
+
+    # 8. Cookies
+    for cookie in (fp.get("cookies") or []):
+        cookie_name = cookie.split("=")[0].lower().strip()
+        for pat, prod in COOKIE_PRODUCT_MAP.items():
+            if pat in cookie_name:
+                _add(prod, 0.1, f"cookie:{cookie_name}")
+                break
+
+    # 9. Detected version from deep probe
+    detected_ver = fp.get("detected_version")
+    if detected_ver:
+        for p in list(candidates):
+            if not candidates[p]["version"]:
+                candidates[p]["version"] = detected_ver
+
+    # Build sorted result
+    result = []
+    for prod, info in candidates.items():
+        result.append({
+            "product": prod,
+            "version": info["version"],
+            "confidence": round(info["confidence"], 2),
+            "signals": info["signals"],
+            "ports": sorted(info["ports"]),
+        })
+    result.sort(key=lambda x: -x["confidence"])
+
+    if result:
+        logger.debug("FUSE: " + ", ".join(f"{r['product']}({r['confidence']})" for r in result[:5]))
+
+    return result[:5]
+
+
+def nmap_to_kg_candidates(nmap_services, tcp_services, logger):
+    """Map nmap/TCP discovered services to product names and look up their CVE fingerprint files."""
+    products_found = {}  # product → {"version": str, "port": int}
+
+    for svc in (nmap_services or []):
+        port = svc.get("port", 0)
+        prod = _normalize_product(svc.get("product") or "")
+        if not prod:
+            prod = PORT_PRODUCT_MAP.get(port, "")
+        if not prod:
+            prod = _normalize_product(svc.get("service") or "")
+        if prod and prod not in ("http", "https", "tcpwrapped", "unknown"):
+            products_found[prod] = {"version": svc.get("version", ""), "port": port}
+
+    for svc in (tcp_services or []):
+        prod = _normalize_product(svc.get("service") or "")
+        if prod and prod not in products_found:
+            products_found[prod] = {"version": svc.get("version", ""), "port": svc.get("port", 0)}
+
+    candidates = []
+    for prod, info in products_found.items():
+        cve_fps = _vulhub_fps_by_product.get(prod, [])
+        if cve_fps:
+            candidates.append({
+                "product": prod,
+                "version": info["version"],
+                "port": info["port"],
+                "cve_fps": cve_fps,
+            })
+            logger.debug(f"NMAP→KG: {prod} (port={info['port']}, ver={info['version']}, "
+                         f"{len(cve_fps)} CVEs in KG)")
+
+    return candidates
+
+
+# ═══════════════════════════════════════════════════════════════
 # Layer 4: Agent — LLM product identification + PoC generation
 # ═══════════════════════════════════════════════════════════════
 
@@ -1904,6 +2103,148 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
                     has_nuclei = True
                     pipeline = "NUCLEI-LIVE→VERIFY"
                     result["pipeline"] = pipeline
+
+            # ── Fingerprint Fusion: unify all tool signals → KAG pipeline ──
+            fused = fuse_fingerprint(fp, logger)
+            # Also map nmap ports to products
+            nmap_kg = nmap_to_kg_candidates(
+                fp.get("nmap_services"), fp.get("tcp_services"), logger)
+            # Merge nmap-discovered products into fused list (avoid dups)
+            fused_products = {c["product"] for c in fused}
+            for nkg in nmap_kg:
+                if nkg["product"] not in fused_products:
+                    fused.append({
+                        "product": nkg["product"],
+                        "version": nkg["version"],
+                        "confidence": 0.3,
+                        "signals": [f"nmap-port:{nkg['port']}"],
+                        "ports": [nkg["port"]],
+                    })
+
+            if fused and not has_nuclei:
+                best_fused = fused[0]
+                fused_product = best_fused["product"]
+                fused_cves = _vulhub_fps_by_product.get(fused_product, [])
+
+                if fused_cves:
+                    logger.info(f"[{idx}/{total}] [{token}] FUSE→KAG: {fused_product} "
+                                f"(conf={best_fused['confidence']}, signals={best_fused['signals'][:3]}, "
+                                f"{len(fused_cves)} CVEs)")
+
+                    # Version probe
+                    version_info = deep_version_probe(host, fused_product, fp, logger)
+                    if version_info.get("version"):
+                        fp["detected_version"] = version_info["version"]
+                        logger.info(f"[{token}] VERSION: {version_info['version']} "
+                                    f"(from {version_info.get('source','')})")
+
+                    # Credential probe
+                    cred_result = probe_default_credentials(host, fused_product, logger)
+                    if cred_result.get("version") and not fp.get("detected_version"):
+                        fp["detected_version"] = cred_result["version"]
+                    fp["default_creds"] = cred_result
+
+                    # Version-based CVE filtering
+                    detected_ver = fp.get("detected_version")
+                    working_cves = fused_cves
+                    if detected_ver and len(fused_cves) > 1:
+                        filtered, excluded = filter_cves_by_version(fused_cves, detected_ver)
+                        if filtered:
+                            logger.info(f"[{token}] VERSION-FILTER: {detected_ver} → "
+                                        f"{len(filtered)} kept, {len(excluded)} excluded")
+                            working_cves = filtered
+
+                    # Probe each CVE's detection path
+                    best_probe_score = 0
+                    best_probe_fp = None
+                    probe_results = {}
+                    tcp_svcs = fp.get("tcp_services")
+                    for cfp in working_cves:
+                        cve_list_c = cfp.get("cve") or []
+                        cve_id_c = cve_list_c[0] if isinstance(cve_list_c, list) and cve_list_c else str(cve_list_c)
+                        pr = probe_cve_detection(host, cfp, tcp_svcs)
+                        probe_results[cve_id_c] = pr
+                        if pr.get("score", 0) > best_probe_score:
+                            best_probe_score = pr["score"]
+                            best_probe_fp = cfp
+
+                    # If a CVE clearly verified
+                    if best_probe_fp and best_probe_score >= 6:
+                        chosen_fp = best_probe_fp
+                        cve_list = chosen_fp.get("cve", [])
+                        cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
+                        pr = probe_results[cve_id]
+                        vuln_class = chosen_fp.get("vuln_class", "")
+                        vuln_type = VULN_TYPE_MAP.get(vuln_class, "安全漏洞")
+                        vuln_name_str = (fused_product + " " + vuln_class).strip()
+                        verify = {
+                            "verified": True,
+                            "evidence_request": pr.get("curl", ""),
+                            "evidence_response": pr.get("response", "")[:2000],
+                            "status_code": pr.get("status", 0),
+                            "matched_indicators": pr.get("matched_indicators", []),
+                        }
+                        evidence = build_evidence_text(target, verify, cve_id, vuln_name_str,
+                                                      pr.get("matched_indicators"))
+                        result.update({
+                            "has_vuln": True, "product": fused_product,
+                            "cve_id": cve_id, "vuln_type": vuln_type, "vuln_name": vuln_name_str,
+                            "confidence": 0.9, "evidence": evidence,
+                            "verify_status": "verified", "status": "fuse_confirmed",
+                            "pipeline": "FUSE→KAG→VERIFY",
+                        })
+                        result["elapsed_sec"] = round(time.monotonic() - t0, 2)
+                        logger.info(f"[{idx}/{total}] [{token}] FUSE ✓ {fused_product} "
+                                    f"{cve_id} (probe_score={best_probe_score})")
+                        return result
+
+                    # LLM disambiguation if multiple CVEs
+                    if len(working_cves) > 1:
+                        llm_pick = llm_disambiguate_cve(target, fp, working_cves, probe_results, logger)
+                        selected_cve = (llm_pick.get("selected_cve") or "").upper()
+                        chosen_fp = None
+                        for cfp in working_cves:
+                            cfp_cves = cfp.get("cve", [])
+                            cfp_cve = cfp_cves[0] if isinstance(cfp_cves, list) and cfp_cves else str(cfp_cves)
+                            if cfp_cve.upper() == selected_cve:
+                                chosen_fp = cfp
+                                break
+                        if not chosen_fp:
+                            chosen_fp = best_probe_fp or working_cves[0]
+                    else:
+                        chosen_fp = working_cves[0]
+
+                    cve_list = chosen_fp.get("cve", [])
+                    cve_id = cve_list[0] if isinstance(cve_list, list) and cve_list else str(cve_list)
+                    pr = probe_results.get(cve_id, {})
+                    vuln_class = chosen_fp.get("vuln_class", "")
+                    verified = bool(pr.get("matched_indicators"))
+                    has_vuln = verified or best_fused["confidence"] >= 0.5
+                    vuln_type = VULN_TYPE_MAP.get(vuln_class, "安全漏洞")
+                    vuln_name_str = (fused_product + " " + vuln_class).strip()
+
+                    if has_vuln:
+                        verify = {
+                            "verified": verified,
+                            "evidence_request": pr.get("curl", ""),
+                            "evidence_response": pr.get("response", "")[:2000],
+                            "status_code": pr.get("status", 0),
+                            "matched_indicators": pr.get("matched_indicators", []),
+                        }
+                        evidence = build_evidence_text(target, verify, cve_id, vuln_name_str)
+                        result.update({
+                            "has_vuln": True, "product": fused_product,
+                            "cve_id": cve_id, "vuln_type": vuln_type, "vuln_name": vuln_name_str,
+                            "confidence": 0.7 if verified else 0.5,
+                            "evidence": evidence,
+                            "verify_status": "verified" if verified else "fuse_high",
+                            "status": "fuse_confirmed", "pipeline": "FUSE→KAG→VERIFY",
+                        })
+                        result["elapsed_sec"] = round(time.monotonic() - t0, 2)
+                        sym = "✓" if verified else "~"
+                        logger.info(f"[{idx}/{total}] [{token}] FUSE {sym} {fused_product} "
+                                    f"{cve_id} conf={result['confidence']}")
+                        return result
 
         fp = fp if isinstance(fp, dict) else surface_fingerprint(host, logger, token)
 
