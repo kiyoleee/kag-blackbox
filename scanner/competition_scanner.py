@@ -74,6 +74,7 @@ _use_nmap = True
 _use_live_nuclei = False
 _no_httpx = False
 _no_sqlmap = False
+_direct_mode = False  # True = connect directly to target (no tunnel)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -131,8 +132,11 @@ def read_targets(path):
                 targets.append({"token": token, "host": host,
                                 "url": line, "path": m.group(2) or "/"})
             elif line.startswith("http"):
-                targets.append({"token": line, "host": line.replace("http://","").rstrip("/"),
-                                "url": line, "path": "/"})
+                host = re.sub(r'^https?://', '', line).split("/")[0]
+                token = host.replace(":", "_").replace(".", "_")
+                path_m = re.match(r'https?://[^/]+(/.*)$', line)
+                targets.append({"token": token, "host": host,
+                                "url": line, "path": path_m.group(1) if path_m else "/"})
     return targets
 
 
@@ -152,12 +156,18 @@ SURFACE_PATHS = [
 
 def http_request(host, path="/", method="GET", headers=None, data=None,
                  timeout=REQUEST_TIMEOUT, tunnel_port=None):
-    port = tunnel_port or LOCAL_TUNNEL_PORT
-    url = f"http://127.0.0.1:{port}{path}"
-    cmd = ["curl", "-s", "-i",
-           "-H", f"Host: {host}",
-           "--connect-timeout", "8",
-           "--max-time", str(timeout)]
+    if _direct_mode:
+        url = f"http://{host}{path}"
+        cmd = ["curl", "-s", "-i",
+               "--connect-timeout", "8",
+               "--max-time", str(timeout)]
+    else:
+        port = tunnel_port or LOCAL_TUNNEL_PORT
+        url = f"http://127.0.0.1:{port}{path}"
+        cmd = ["curl", "-s", "-i",
+               "-H", f"Host: {host}",
+               "--connect-timeout", "8",
+               "--max-time", str(timeout)]
     if method != "GET":
         cmd.extend(["-X", method])
     if headers:
@@ -2065,7 +2075,7 @@ def process_target(target, nuclei_data, total, use_fallback, logger):
             fp = surface_fingerprint(host, logger, token)
 
             # nmap port scan for non-Traefik targets (direct IP:port access)
-            if _use_nmap and not host.endswith(".rce.lab"):
+            if _use_nmap and (_direct_mode or not host.endswith(".rce.lab")):
                 nmap_result = nmap_scan(host, logger)
                 if nmap_result.get("ports"):
                     fp["nmap_services"] = nmap_result["ports"]
@@ -2602,6 +2612,7 @@ def main():
     _use_live_nuclei = args.live_nuclei
     _no_httpx = args.no_httpx
     _no_sqlmap = args.no_sqlmap
+    _direct_mode = args.no_tunnel
     _nuclei_bin = args.nuclei_bin
     _surper_templates = args.surper_templates
 
